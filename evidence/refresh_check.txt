@@ -1,0 +1,2 @@
+REFRESH MODEL CHECK  alphabet=7  depth=5  sequences=16807  nodes=19607  results={'ok': 1918, 'invalid_grant': 11786, 'invalid_scope': 301}  violations=0  (23.8s)
+RESULT: PASS

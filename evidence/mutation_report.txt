@@ -1,0 +1,27 @@
+M01 ignore token expiry                              KILLED    FAIL: test_leeway_boundaries (tests.test_auth.ClaimTests.test_leeway_boundaries)
+M02 ignore audience                                  KILLED    FAIL: test_rejections (tests.test_auth.ClaimTests.test_rejections)
+M03 ignore issuer                                    KILLED    FAIL: test_rejections (tests.test_auth.ClaimTests.test_rejections)
+M04 HS256 signature always accepted                  KILLED    FAIL: test_kidless_hs256_only_when_configured (tests.test_auth.ClaimTests.test_kidless_hs256_only_when_configu
+M05 no alg/kid algorithm pinning                     KILLED    FAIL: test_rejections (tests.test_auth.ClaimTests.test_rejections)
+M06 kid-less tokens always accepted                  KILLED    FAIL: test_kidless_hs256_only_when_configured (tests.test_auth.ClaimTests.test_kidless_hs256_only_when_configu
+M07 revoked signing keys still verify                KILLED    FAIL: test_revoking_active_key_rolls_a_new_one (tests.test_auth.KeyringTests.test_revoking_active_key_rolls_a_
+M08 retired keys never expire                        KILLED    FAIL: test_rotation_retire_grace_and_expiry (tests.test_auth.KeyringTests.test_rotation_retire_grace_and_expir
+M09 iat-in-future not checked                        KILLED    FAIL: test_leeway_boundaries (tests.test_auth.ClaimTests.test_leeway_boundaries)
+M10 revocation list ignored                          KILLED    FAIL: test_revocation_oracle_and_audit_chain (tests.test_auth.RevocationAndAudit.test_revocation_oracle_and_au
+M11 scope implication memory:admin removed           KILLED    ERROR: test_valid_token_and_scope_expansion (tests.test_auth.ClaimTests.test_valid_token_and_scope_expansion)
+M12 JWKS publishes nothing about RSA modulus correctly (n omitted) KILLED    ERROR: test_published_rsa_key_alone_is_enough_to_verify_signatures (tests.test_auth.KeyringTests.test_publishe
+M13 RS256 verify skips padding comparison            KILLED    FAIL: test_published_rsa_key_alone_is_enough_to_verify_signatures (tests.test_auth.KeyringTests.test_published
+M14 refresh reuse not detected                       KILLED    FAIL: test_client_credentials_refresh_reuse_over_http (tests.test_tokens.Endpoints.test_client_credentials_ref
+M15 refresh client binding not enforced              KILLED    FAIL: test_client_binding_expiry_malformed (tests.test_tokens.RefreshRotation.test_client_binding_expiry_malfo
+M16 client lockout never triggers                    KILLED    FAIL: test_client_lockout_after_repeated_failures (tests.test_tokens.Endpoints.test_client_lockout_after_repea
+M17 client secret not checked (only client id)       KILLED    FAIL: test_client_lockout_after_repeated_failures (tests.test_tokens.Endpoints.test_client_lockout_after_repea
+M18 no per-method scope enforcement                  KILLED    ERROR: test_error_data_names_required_scope (tests.test_protocol.ScopeEnforcementTests.test_error_data_names_r
+M25 refresh scope escalation allowed                 KILLED    FAIL: test_depth3_all_sequences_pass (tests.test_tokens.RefreshModelCheck.test_depth3_all_sequences_pass)
+M19 allow requests before initialize                 KILLED    FAIL: test_all_sequences_up_to_length_5 (tests.test_protocol.LifecycleModelCheck.test_all_sequences_up_to_leng
+M20 audit: ignore prev-link                          KILLED    FAIL: test_recomputed_hash_forgery_breaks_next_link (tests.test_persistence_audit.AuditTests.test_recomputed_h
+M21 audit: ignore entry hash                         KILLED    FAIL: test_revocation_oracle_and_audit_chain (tests.test_auth.RevocationAndAudit.test_revocation_oracle_and_au
+M22 booleans accepted as ids                         KILLED    FAIL: test_invalid_request_echoes_valid_id_only (tests.test_jsonrpc.JsonRpcTests.test_invalid_request_echoes_v
+M23 HTTP session not bound to subject                KILLED    FAIL: test_session_not_shared_between_subjects (tests.test_http_e2e.HttpE2E.test_session_not_shared_between_su
+M24 schema ignores additionalProperties:false        KILLED    FAIL: test_required_and_additional (tests.test_schema.SchemaTests.test_required_and_additional)
+
+mutants killed: 25/25

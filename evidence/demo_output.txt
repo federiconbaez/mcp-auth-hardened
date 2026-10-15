@@ -1,0 +1,129 @@
+mcp-auth-hardened demo (Python 3.13.5)
+mcp-auth-hardened demo  |  python 3.13.5  |  workdir /tmp/mcpauth-demo-uueodo6s
+
+==============================================================================
+== 1. Start the HTTP server; discovery document and JWKS (which must leak nothing secret)
+==============================================================================
+$ python3 -m mcpauth client-secret demo-client --data-dir /tmp/mcpauth-demo-uueodo6s/data
+$ python3 -m mcpauth client-secret admin-client --data-dir /tmp/mcpauth-demo-uueodo6s/data
+   {"event": "ready", "transport": "http", "url": "http://127.0.0.1:34591/mcp", "port": 34591, "issuer": "http://127.0.0.1:34591", "audience": "mcp-auth-hardened", "auth": "auth enabled", "llm": false, "data_dir": "/tmp/mcpauth-demo-uueodo6s/data"}
+   [ok] discovery doc advertises jwks_uri, introspection, revocation, refresh_token grant
+   [ok] JWKS does not contain the HS256 signing secret (1 secret(s) checked)
+   [ok] JWKS carries no private members (d / k)
+   [ok] keys.json is mode 0600
+
+==============================================================================
+== 2. client_credentials grant with offline_access; use the access token over MCP
+==============================================================================
+   [ok] token endpoint issued an access token and a refresh token
+   [ok] access token header carries alg=HS256 kid=k-4cc74441
+POST /mcp -> {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "demo", "version": "1"}}}
+<- HTTP 200 {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-03-26", "capabilities": {"tools": {"listChanged": false}, "resources": {"subscribe": false, "listChanged": false}, "prompts": {"listChanged": false}, "experimental": {"mcpauth/ ...
+POST /mcp -> {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "memory_store", "arguments": {"content": "stored through a hardened token"}}}
+<- HTTP 200 {"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": "{\n  \"stored\": {\n    \"content\": \"stored through a hardened token\",\n    \"created_at\": \"2026-10-15T04:00:41Z\",\n    \"created_by\": \"demo-client\",\n    ...
+   [ok] authenticated tools/call works
+
+==============================================================================
+== 3. Per-method scope enforcement
+==============================================================================
+POST /mcp -> {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "demo", "version": "1"}}}
+<- HTTP 200 {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-03-26", "capabilities": {"tools": {"listChanged": false}, "resources": {"subscribe": false, "listChanged": false}, "prompts": {"listChanged": false}, "experimental": {"mcpauth/ ...
+POST /mcp -> {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+<- HTTP 200 {"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "memory_store", "description": "Persist a note in local SQLite memory (survives restarts). Returns the new entry id.", "inputSchema": {"type": "object", "additionalProperties": false ...
+   [ok] tools:read can list tools
+POST /mcp -> {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "memory_recall", "arguments": {"query": "x"}}}
+<- HTTP 200 {"jsonrpc": "2.0", "id": 3, "error": {"code": -32003, "message": "Insufficient scope", "data": {"required": ["memory:read"], "granted": ["mcp", "tools:read"]}}}
+   [ok] tools:read cannot CALL tools -> -32003 (HTTP 200)
+   [ok] error data names what was missing: {"required": ["memory:read"], "granted": ["mcp", "tools:read"]}
+
+==============================================================================
+== 4. Refresh-token rotation and REUSE DETECTION (stolen refresh token replayed)
+==============================================================================
+   [ok] refresh rotates: a NEW refresh token is returned
+   [ok] replaying the OLD refresh token fails: {"error": "invalid_grant", "error_description": "refresh token reuse detected; the whole token famil ...
+   [ok] the legitimate NEW refresh token is now dead too: the whole family was revoked
+   [ok] access token of the revoked family is rejected (HTTP 401)
+$ python3 -m mcpauth token-audit-verify --data-dir /tmp/mcpauth-demo-uueodo6s/data
+   [ok] token audit log records reuse_detected and its chain verifies
+
+==============================================================================
+== 5. Introspection (privileged clients only) and revocation by jti
+==============================================================================
+   [ok] admin-client introspection: active=true
+   [ok] an ordinary client may not introspect (HTTP 403)
+   [ok] revocation endpoint answers 200
+   [ok] after revocation: introspection says active=false and nothing else (no oracle)
+   [ok] revoking garbage also answers 200 (RFC 7009: no information leak)
+
+==============================================================================
+== 6. Key rotation: kid, grace period, RS256, verification by OpenSSL, revocation of a key
+==============================================================================
+$ python3 -m mcpauth mint-token --data-dir /tmp/mcpauth-demo-uueodo6s/data --issuer http://127.0.0.1:34591 --sub before-rotation
+$ python3 -m mcpauth keys rotate --alg RS256 --bits 1024 --data-dir /tmp/mcpauth-demo-uueodo6s/data
+$ python3 -m mcpauth mint-token --data-dir /tmp/mcpauth-demo-uueodo6s/data --issuer http://127.0.0.1:34591 --sub after-rotation
+   [ok] new tokens are RS256 under the new kid k-0620eeda
+   [ok] old HS256 token (retired key, grace period) is accepted by the running server
+   [ok] new RS256 token is accepted by the running server
+$ python3 -m mcpauth keys pubkey k-0620eeda --data-dir /tmp/mcpauth-demo-uueodo6s/data
+   [ok] OpenSSL independently verifies the hand-written RS256 signature: Verified OK
+   [ok] OpenSSL rejects a signature with a flipped byte (sanity check of the check)
+   [ok] JWKS now publishes the RS256 public key (n,e) only
+   [ok] token with a corrupted RS256 signature -> 401
+$ python3 -m mcpauth keys revoke k-4cc74441 --data-dir /tmp/mcpauth-demo-uueodo6s/data
+   [ok] after `keys revoke k-4cc74441` the old-key token is rejected immediately
+
+==============================================================================
+== 7. Algorithm confusion, alg=none, kid-less tokens, clock-skew leeway
+==============================================================================
+   [ok] alg=none -> 401
+   [ok] HS256 header on the RS256 kid (alg confusion) -> 401
+   [ok] token without kid -> 401 (kid is mandatory unless --allow-kidless)
+$ python3 -m mcpauth mint-token --data-dir /tmp/mcpauth-demo-uueodo6s/data --issuer http://127.0.0.1:34591 --ttl=-10
+   [ok] expired 10 s ago: inside the 30 s leeway -> accepted
+$ python3 -m mcpauth mint-token --data-dir /tmp/mcpauth-demo-uueodo6s/data --issuer http://127.0.0.1:34591 --ttl=-300
+   [ok] expired 5 min ago: outside the leeway -> rejected
+
+==============================================================================
+== 8. Brute-force protection: client lockout (429 + Retry-After), other clients unaffected
+==============================================================================
+   [ok] wrong secrets: [401, 401, 401, 401, 429, 429] (lockout after the threshold)
+   [ok] even the right secret is refused while locked out (Retry-After: 30)
+   [ok] another client (admin-client) is unaffected
+
+==============================================================================
+== 9. Hash-chained token audit log: verify, tamper, detect; no raw tokens inside
+==============================================================================
+$ python3 -m mcpauth token-audit-verify --data-dir /tmp/mcpauth-demo-uueodo6s/data
+   [ok] token_audit.log chain verifies: {
+  "count": 44,
+  "error": null,
+  "head": "70b845c7616c88be123fe9efa2062bbaa0b24693a14705acba39493
+   [ok] the log contains no JWT and no refresh token
+$ python3 -m mcpauth token-audit-verify --data-dir /tmp/mcpauth-demo-uueodo6s/tampered
+   [ok] after editing entry #4 the verifier exits 1: {
+  "count": 3,
+  "error": "entry hash mismatch (content modified)",
+  "head": "be19e6c6424272d05808
+
+==============================================================================
+== 10. stdio: same hardened validation, revocation noticed mid-session
+==============================================================================
+$ python3 -m mcpauth mint-token --data-dir /tmp/mcpauth-demo-uueodo6s/data --issuer http://127.0.0.1:34591 --sub stdio-user
+   (server process started, pid 180545, transport=stdio)
+-> {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": {"name": "demo-client", "version": "1.0"}}}
+<- {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-03-26", "capabilities": {"tools": {"listChanged": false}, "resources": {"subscribe": false, "listChanged": false}, "prompts": {"listChanged": false}, "experimental": {"mcpauth/auditChain": {"algor ...
+-> {"jsonrpc": "2.0", "method": "notifications/initialized"}   (notification, no reply expected)
+-> {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+<- {"jsonrpc": "2.0", "id": 2, "result": {"tools": [{"name": "memory_store", "description": "Persist a note in local SQLite memory (survives restarts). Returns the new entry id.", "inputSchema": {"type": "object", "additionalProperties": false, "required": ["cont ...
+   [ok] stdio session works with a valid token
+$ python3 -m mcpauth token-revoke --data-dir /tmp/mcpauth-demo-uueodo6s/data --issuer http://127.0.0.1:34591 eyJhbGciOiJSUzI1NiIsImtpZCI6ImstMDYyMGVlZGEiLCJ0eXAiOiJKV1QifQ.eyJhdWQiOiJtY3AtYXV0aC1oYXJkZW5lZCIsImV4cCI6MTc5MjA0MDQ0MiwiaWF0IjoxNzkyMDM2ODQyLCJpc3MiOiJodHRwOi8vMTI3LjAuMC4xOjM0NTkxIiwianRpIjoiYmE3YmJkZTAwNjgxOTdmM2M4NDc1NmMxIiwibmJmIjoxNzkyMDM2ODQyLCJzY29wZSI6Im1jcCB0b29sczpyZWFkIHRvb2xzOndyaXRlIHJlc291cmNlczpyZWFkIHByb21wdHM6cmVhZCBtZW1vcnk6cmVhZCBtZW1vcnk6d3JpdGUgbWVtb3J5OmFkbWluIGF1ZGl0OnJlYWQgYXV0aDphZG1pbiIsInN1YiI6InN0ZGlvLXVzZXIifQ.xyS_TOw7ZLIETy3TUeeAE4FAR1iHyZgTJx-jzKezD7rhfhpmW8E1jUNTVt-KjtKMujLBATlt8aGBfbq827c5MLQ-ey_HgU9EZoADMYhGSOEcfO29k_LxN5tYrQ1BonlASgLks4FwVFolnn70kJjF8lMvkvtT-k9OK5GzYjO3PdU
+-> {"jsonrpc": "2.0", "id": 3, "method": "tools/list"}
+<- {"jsonrpc": "2.0", "id": 3, "error": {"code": -32001, "message": "Unauthorized: token expired", "data": {"error": "invalid_token"}}}
+   [ok] after revocation the SAME live stdio session is refused (-32001)
+   (server process pid 180545 exited with code 0)
+$ python3 -m mcpauth audit-verify --data-dir /tmp/mcpauth-demo-uueodo6s/data
+   [ok] request audit log chain verifies
+
+==============================================================================
+== DEMO OK - 42/42 steps passed
+==============================================================================

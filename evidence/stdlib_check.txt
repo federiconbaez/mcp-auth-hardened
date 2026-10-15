@@ -1,0 +1,66 @@
+STDLIB-ONLY CHECK (ast-based; nothing was imported or executed)
+python 3.13.5, 290 stdlib modules known to this interpreter
+
+file                                 code  total  imports (stdlib/local)
+demo.py                               339    402  base64,hashlib,http,json,os,shutil,signal,socket,subprocess,sys,tempfile,threading,time,urllib
+mcpauth/__init__.py                     6     11  
+mcpauth/__main__.py                     3      5  sys  | local: .cli
+mcpauth/audit.py                      132    153  fcntl,hashlib,json,os,threading,time
+mcpauth/auth.py                       385    453  base64,binascii,hashlib,hmac,json,math,os,re,secrets,time  | local: .
+mcpauth/catalog.py                    275    314  json,re,sqlite3,urllib  | local: .,.llm,.memory
+mcpauth/cli.py                        245    299  argparse,json,os,signal,sys,threading  | local: .,.audit,.auth,.conformance,.llm,.server,.tokens,.transport_http,.transport_stdio
+mcpauth/conformance.py                963   1234  base64,hashlib,hmac,http,json,os,queue,re,shutil,socket,subprocess,sys,tempfile,threading,time,urllib  | local: .,.audit,.auth
+mcpauth/contracts.py                   73    100  functools,os,threading
+mcpauth/fuzz.py                       164    193  json,random
+mcpauth/jsonrpc.py                    208    255  collections,json  | local: .
+mcpauth/llm.py                         44     52  json,os,urllib
+mcpauth/memory.py                     127    152  contextlib,json,os,re,sqlite3,time,unicodedata
+mcpauth/refreshcheck.py               165    191  copy,os,shutil,tempfile  | local: .auth,.tokens
+mcpauth/rsa.py                        110    140  base64,hashlib,hmac,secrets
+mcpauth/schema.py                     204    241  re
+mcpauth/server.py                     305    352  json,os,secrets,threading,time  | local: .,.audit,.auth,.catalog,.jsonrpc,.memory
+mcpauth/tokens.py                     357    414  base64,binascii,contextlib,hashlib,hmac,json,os,secrets,sqlite3,threading,time  | local: .,.audit,.auth
+mcpauth/transport_http.py             266    304  http,json,threading,time,urllib  | local: .,.auth,.jsonrpc,.tokens
+mcpauth/transport_stdio.py             37     45  sys  | local: .jsonrpc
+tests/__init__.py                       0      0  
+tests/helpers.py                      103    137  json,os,shutil,subprocess,sys,tempfile,threading,unittest  | local: mcpauth.auth,mcpauth.server,mcpauth.tokens,mcpauth.transport_http
+tests/test_auth.py                    224    260  base64,hashlib,hmac,json,os,unittest  | local: mcpauth,mcpauth.audit,mcpauth.auth,mcpauth.tokens,tests.helpers
+tests/test_fuzz.py                     99    112  json,random,unittest  | local: mcpauth,mcpauth.auth,tests,tests.helpers
+tests/test_http_e2e.py                217    248  base64,http,json,os,subprocess,sys,unittest,urllib  | local: tests,tests.helpers
+tests/test_jsonrpc.py                 129    158  json,unittest  | local: mcpauth,mcpauth.jsonrpc,tests
+tests/test_llm_and_tools.py           123    142  http,json,os,shutil,subprocess,sys,tempfile,threading,unittest  | local: mcpauth.llm,tests,tests.helpers
+tests/test_persistence_audit.py       180    208  json,os,threading,unittest  | local: mcpauth.audit,mcpauth.memory,tests,tests.helpers
+tests/test_protocol.py                308    356  itertools,json,os,unittest  | local: mcpauth.tokens,tests,tests.helpers
+tests/test_rsa.py                      94    113  hashlib,os,shutil,subprocess,tempfile,unittest  | local: mcpauth
+tests/test_schema.py                   83     98  tempfile,unittest  | local: mcpauth,mcpauth.catalog,mcpauth.memory,tests
+tests/test_stdio_e2e.py                71     83  json,unittest  | local: tests,tests.helpers
+tests/test_tokens.py                  254    297  base64,json,os,sqlite3,threading,unittest,urllib  | local: mcpauth,mcpauth.auth,mcpauth.tokens,tests,tests.helpers,tests.test_http_e2e
+tools/adaptation_report.py             47     58  difflib,os,sys
+tools/check_doc_refs.py                51     59  glob,os,re,sys
+tools/check_stdlib_only.py            142    161  argparse,ast,json,os,subprocess,sys
+tools/gen_originality.py               72     88  hashlib,os,re,subprocess,sys
+tools/make_manifest.py                 60     73  argparse,hashlib,os,sys
+tools/mutation_sanity.py               78     90  argparse,concurrent,os,shutil,subprocess,sys,tempfile
+tools/refresh_check.py                 28     34  argparse,json,os,sys,time  | local: mcpauth
+
+files: 40   lines: total=8085 code=6771 comment=102 blank=1212
+stdlib modules used (35): argparse, ast, base64, binascii, collections, concurrent, contextlib, copy, difflib, fcntl, functools, glob, hashlib, hmac, http, itertools, json, math, os, queue, random, re, secrets, shutil, signal, socket, sqlite3, subprocess, sys, tempfile, threading, time, unicodedata, unittest, urllib
+
+GIT HISTORY (oldest first):
+e4606fc|Grok Bot (mcp-family build)|2026-10-15T02:47:10Z|Import mcp-forge base (adapted: package renamed, project-specific audience/paths); variant work follows
+
+ 34 files changed, 5745 insertions(+)
+ad492d3|Grok Bot (mcp-family build)|2026-10-15T03:02:37Z|Auth-hardened: keyring (HS256+RS256 by hand), kid rotation, claims/leeway/revocation, refresh rotation with reuse detection, introspection, lockout, rate limit, token audit chain
+
+ 7 files changed, 1249 insertions(+), 263 deletions(-)
+fb43424|Grok Bot (mcp-family build)|2026-10-15T03:11:24Z|Auth-hardened: HRD conformance checks, fix revoke-active-key and 500-on-handler-crash bugs, hardened test suites (rsa/openssl interop, keyring, claims, refresh, endpoints, rate limit, model check)
+
+ 15 files changed, 1222 insertions(+), 201 deletions(-)
+671e4fd|Grok Bot (mcp-family build)|2026-10-15T03:38:32Z|Auth-hardened: end-to-end demo (42 steps incl. OpenSSL RS256 verification), tools: gen_originality, top-level manifest
+
+ 4 files changed, 394 insertions(+), 144 deletions(-)
+f21031b|Grok Bot (mcp-family build)|2026-10-15T03:47:48Z|Auth-hardened: README/AUDIT/ORIGINALITY/SECURITY, mutation suite rewritten for auth (25 mutants), JWKS test, evidence tooling
+
+ 11 files changed, 460 insertions(+), 29 deletions(-)
+
+RESULT: PASS - zero third-party imports, no dynamic imports/exec/eval, no dependency manifests
