@@ -18,6 +18,18 @@ from .memory import MemoryStore
 UNAUTHORIZED = -32001
 RESOURCE_NOT_FOUND = -32002  # the code MCP specifies for "resource not found"
 INSUFFICIENT_SCOPE = -32003
+RATE_LIMITED = -32005
+
+# Per-method scope table (method-level scopes; tools/resources/prompts add per-item scopes on top).
+METHOD_SCOPES = {
+    "tools/list": ("tools:read",),
+    "resources/list": ("resources:read",),
+    "resources/templates/list": ("resources:read",),
+    "resources/read": ("resources:read",),
+    "prompts/list": ("prompts:read",),
+    "prompts/get": ("prompts:read",),
+    "tools/call": ("tools:read",),  # + the tool's own scopes
+}
 
 PRE_INIT_METHODS = ("initialize", "ping")
 
@@ -47,13 +59,16 @@ PROMPTS_GET_SCHEMA = {"type": "object", "additionalProperties": False, "required
 class McpServer:
     """State shared by all sessions of one server process."""
 
-    def __init__(self, data_dir, authenticator=None, llm=None, audit_fsync=True):
+    def __init__(self, data_dir, authenticator=None, llm=None, audit_fsync=True, service=None, token_audit=None, limiter=None):
         os.makedirs(data_dir, mode=0o700, exist_ok=True)
         self.data_dir = data_dir
         self.auth = authenticator  # None => authentication disabled (--no-auth)
         self.memory = MemoryStore(os.path.join(data_dir, "memory.sqlite3"))
         self.audit = AuditLog(os.path.join(data_dir, "audit.log"), fsync=audit_fsync)
-        self.catalog = Catalog(self.memory, llm)
+        self.service = service
+        self.token_audit = token_audit
+        self.limiter = limiter  # RateLimiter or None
+        self.catalog = Catalog(self.memory, llm, service, authenticator, token_audit)
 
     def new_session(self, transport, token=None):
         return Session(self, transport, token)
@@ -150,6 +165,9 @@ class Session:
         fn = self._methods.get(method)
         if fn is None:
             raise RpcError(METHOD_NOT_FOUND, "Method not found", {"method": method})
+        if method != "ping":
+            self._rate_limit()
+        self._require_scopes(METHOD_SCOPES.get(method, ()))
         return fn(req)
 
     # ---- auth helpers --------------------------------------------------------------
@@ -159,9 +177,26 @@ class Session:
         return bool(self.claims) and scope in self.claims.get("_scopes", ())
 
     def _require_scope(self, scope):
-        if not self._has_scope(scope):
+        self._require_scopes((scope,))
+
+    def _require_scopes(self, scopes):
+        missing = [s for s in scopes if not self._has_scope(s)]
+        if missing:
+            self.server.log_event("scope_denied", {"required": missing, "sub": self.subject}, self.transport, self.id, self.subject)
+            if self.server.service is not None:
+                self.server.service._audit("scope_denied", sub=self.subject, required=" ".join(missing))
             raise RpcError(INSUFFICIENT_SCOPE, "Insufficient scope", {
-                "required": [scope], "granted": (self.claims or {}).get("_scopes", [])})
+                "required": missing, "granted": (self.claims or {}).get("_scopes", [])})
+
+    def _rate_limit(self):
+        lim = self.server.limiter
+        if lim is None:
+            return
+        ok, retry = lim.allow("sub:" + self.subject)
+        if not ok:
+            if self.server.service is not None:
+                self.server.service._audit("rate_limited", sub=self.subject, retry_after=round(retry, 2))
+            raise RpcError(RATE_LIMITED, "Rate limit exceeded", {"retry_after_seconds": round(retry, 2)})
 
     def _check_token_still_valid(self):
         auth = self.server.auth
@@ -177,7 +212,7 @@ class Session:
                 raise RpcError(UNAUTHORIZED, "Unauthorized: no token provided (stdio: set MCP_TOKEN)",
                                {"error": "invalid_request"})
             try:
-                self.claims = auth.verify(self.token, [BASE_SCOPE])
+                self.claims = auth.verify(self.token, [BASE_SCOPE], source="stdio")
             except AuthError as exc:
                 code = INSUFFICIENT_SCOPE if exc.error == "insufficient_scope" else UNAUTHORIZED
                 self.server.log_event("auth_failure", {"error": exc.error, "reason": exc.description}, self.transport, self.id)
@@ -219,9 +254,9 @@ class Session:
         result = {
             "protocolVersion": chosen,
             "capabilities": capabilities,
-            "serverInfo": {"name": "mcp-auth-hardened", "title": "MCP Forge (stdlib-only reference server)", "version": __version__},
-            "instructions": "Persistent memory server. Use memory_store / memory_recall / memory_list / memory_forget; "
-                            "read memory://index and audit://chain; prompts: recall_and_summarize, memory_digest.",
+            "serverInfo": {"name": "mcp-auth-hardened", "title": "MCP Auth-Hardened (multi-scope, rotating-key, refresh-rotating server)", "version": __version__},
+            "instructions": "Memory server behind hardened OIDC-style auth. Every method needs specific scopes (tools:read, tools:write, "
+                            "resources:read, prompts:read, memory:*, audit:read, auth:admin); call the whoami tool to see yours.",
         }
         contracts.check("MCP-2", chosen in SUPPORTED_PROTOCOL_VERSIONS, "unsupported version negotiated")
         for cap in ("tools", "resources", "prompts"):
@@ -243,9 +278,9 @@ class Session:
         tool = self.server.catalog.tools.get(params["name"])
         if tool is None:
             raise RpcError(INVALID_PARAMS, "Unknown tool: %s" % params["name"], {"errors": ["unknown tool"]})
-        self._require_scope(tool.scope)
+        self._require_scopes(tool.scopes)
         try:
-            out = self.server.catalog.call_tool(tool, params.get("arguments", {}), {"sub": self.subject})
+            out = self.server.catalog.call_tool(tool, params.get("arguments", {}), {"sub": self.subject, "claims": self.claims})
         except ToolError as exc:
             return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
         result = {"content": [{"type": "text", "text": json_text(out)}], "isError": False}
@@ -255,8 +290,7 @@ class Session:
 
     def _resources_list(self, req):
         self._list_params(req)
-        return {"resources": self.server.catalog.list_resources(
-            self._has_scope("memory:read"), self._has_scope("audit:read"))}
+        return {"resources": self.server.catalog.list_resources(self._has_scope)}
 
     def _templates_list(self, req):
         self._list_params(req)
@@ -280,6 +314,16 @@ class Session:
         elif kind == "tag":
             _, entries = cat.memory.list(limit=50, tag=arg)
             body = {"tag": arg, "entries": entries}
+        elif kind == "whoami":
+            c = self.claims or {}
+            body = {"sub": self.subject, "granted_scopes": c.get("_granted", []), "effective_scopes": c.get("_scopes", []), "kid": c.get("_kid", ""), "exp": c.get("exp")}
+        elif kind == "token_audit":
+            ta = self.server.token_audit
+            body = {"chain": ta.verify() if ta else None, "tail": [dict(e, payload=str(e.get("payload", ""))[:300]) for e in (ta.tail(10) if ta else [])]}
+        elif kind == "keys":
+            body = {"keys": self.server.auth.keyring.public_view() if self.server.auth else []}
+        elif kind == "revocations":
+            body = self.server.service.store.list_revoked() if self.server.service else {"jti": [], "families": []}
         else:
             body = self._audit_snapshot()
         return {"contents": [{"uri": uri, "mimeType": "application/json", "text": json_text(body)}]}

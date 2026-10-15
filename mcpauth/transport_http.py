@@ -18,7 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, urlsplit
 
 from . import SUPPORTED_PROTOCOL_VERSIONS
-from .auth import BASE_SCOPE, AuthError, OidcIssuer
+from .auth import BASE_SCOPE, AuthError
+from .tokens import Lockout, OidcIssuer
 from .jsonrpc import INVALID_REQUEST, PARSE_ERROR, dumps
 
 LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
@@ -26,7 +27,7 @@ LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
 
 class HttpTransport:
     def __init__(self, server, host="127.0.0.1", port=8765, max_body=1 << 20, max_sessions=256,
-                 session_ttl=3600, allowed_origins=()):
+                 session_ttl=3600, allowed_origins=(), lockout=None, client_lockout=None):
         self.server = server
         self.auth = server.auth
         self.max_body = max_body
@@ -46,10 +47,12 @@ class HttpTransport:
         self.host, self.port = self.httpd.server_address[0], self.httpd.server_address[1]
         self.base_url = "http://%s:%d" % (self.host if ":" not in self.host else "[%s]" % self.host, self.port)
         self.issuer = None
+        self.lockout = None
         if self.auth is not None:
             if self.auth.issuer is None:
                 self.auth.issuer = self.base_url
-            self.issuer = OidcIssuer(self.auth)
+            self.lockout = lockout or Lockout()                 # failed bearer tokens per remote address
+            self.issuer = OidcIssuer(self.auth, server.service, client_lockout or Lockout(threshold=5, window=60, duration=30))
 
     def serve_forever(self):
         self.httpd.serve_forever(poll_interval=0.1)
@@ -137,6 +140,12 @@ class _Handler(BaseHTTPRequestHandler):
         auth = self.app.auth
         if auth is None:
             return True, None
+        ip = self.client_address[0]
+        wait = self.app.lockout.remaining("ip:" + ip)
+        if wait > 0:
+            self._event("lockout_block", {"ip": ip})
+            self._json(429, {"error": "too_many_failed_attempts", "error_description": "retry later"}, {"Retry-After": str(int(wait) + 1)})
+            return False, None
         header = self.headers.get("Authorization", "")
         if not header.lower().startswith("bearer "):
             self._event("auth_failure", {"reason": "missing bearer token"})
@@ -144,8 +153,14 @@ class _Handler(BaseHTTPRequestHandler):
                        {"WWW-Authenticate": 'Bearer realm="mcp-auth-hardened"'})
             return False, None
         try:
-            return True, auth.verify(header[7:].strip(), [BASE_SCOPE])
+            claims = auth.verify(header[7:].strip(), [BASE_SCOPE], source="http")
+            self.app.lockout.success("ip:" + ip)
+            return True, claims
         except AuthError as exc:
+            if exc.error == "invalid_token" and self.app.lockout.failure("ip:" + ip):
+                self._event("lockout", {"ip": ip})
+                if self.app.server.service:
+                    self.app.server.service._audit("lockout", source="ip:" + ip)
             self._event("auth_failure", {"error": exc.error, "reason": exc.description})
             hdr = 'Bearer realm="mcp-auth-hardened", error="%s", error_description="%s"' % (exc.error, exc.description.replace('"', "'"))
             if exc.error == "insufficient_scope":
@@ -172,6 +187,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._json(200, {"status": "ok"})
         if path == "/.well-known/openid-configuration" and self.app.issuer:
             return self._json(200, self.app.issuer.discovery_document())
+        if path == "/.well-known/jwks.json" and self.app.issuer:
+            return self._json(200, self.app.issuer.jwks())
         if path == "/mcp":
             return self._json(405, {"error": "method_not_allowed", "detail": "no SSE stream offered; use POST"},
                               {"Allow": "POST, DELETE"})
@@ -181,8 +198,8 @@ class _Handler(BaseHTTPRequestHandler):
         path = self._path()
         if path == "/mcp":
             return self._post_mcp()
-        if path == "/oauth/token" and self.app.issuer:
-            return self._post_token()
+        if path in ("/oauth/token", "/oauth/introspect", "/oauth/revoke") and self.app.issuer:
+            return self._post_token(path)
         self._json(404, {"error": "not_found"})
 
     def do_DELETE(self):
@@ -211,7 +228,7 @@ class _Handler(BaseHTTPRequestHandler):
     do_PATCH = do_PUT
 
     # ---- /oauth/token ------------------------------------------------------------------
-    def _post_token(self):
+    def _post_token(self, path):
         body = self._read_body(8192)
         if body is None:
             return
@@ -221,10 +238,12 @@ class _Handler(BaseHTTPRequestHandler):
             form = dict(parse_qsl(body.decode("utf-8"), keep_blank_values=True))
         except UnicodeDecodeError:
             return self._json(400, {"error": "invalid_request"})
-        status, payload = self.app.issuer.token_request(self.headers.get("Authorization"), form)
-        self._event("token_issued" if status == 200 else "token_denied",
-                    {"client": form.get("client_id", "(basic)")[:64], "status": status})
-        self._json(status, payload, {"Pragma": "no-cache"})
+        issuer = self.app.issuer
+        handler = {"/oauth/token": issuer.token_request, "/oauth/introspect": issuer.introspect_request, "/oauth/revoke": issuer.revoke_request}[path]
+        status, payload, headers = handler(self.headers.get("Authorization"), form)
+        if path == "/oauth/token":
+            self._event("token_issued" if status == 200 else "token_denied", {"client": form.get("client_id", "(basic)")[:64], "status": status, "grant": form.get("grant_type", "")[:32]})
+        self._json(status, payload, dict(headers))
 
     # ---- POST /mcp ---------------------------------------------------------------------
     def _post_mcp(self):

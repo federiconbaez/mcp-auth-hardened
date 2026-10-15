@@ -24,7 +24,8 @@ class Tool:
                  destructive=False, needs_llm=False):
         schema.check_schema(input_schema)
         self.name, self.title, self.description = name, title, description
-        self.input_schema, self.scope, self.func = input_schema, scope, func
+        self.input_schema, self.func = input_schema, func
+        self.scopes = (scope,) if isinstance(scope, str) else tuple(scope)
         self.read_only, self.destructive, self.needs_llm = read_only, destructive, needs_llm
         self.output_schema = output_schema
 
@@ -41,9 +42,13 @@ class Tool:
 
 
 class Catalog:
-    def __init__(self, memory, llm=None):
+    def __init__(self, memory, llm=None, service=None, authenticator=None, token_audit=None, audit=None):
         self.memory = memory
         self.llm = llm
+        self.service = service
+        self.authenticator = authenticator
+        self.token_audit = token_audit
+        self.audit = audit
         self.tools = {}
         self._register_tools()
 
@@ -61,7 +66,7 @@ class Catalog:
                 "content": {"type": "string", "minLength": 1, "maxLength": 4000, "description": "Text to remember"},
                 "tags": {"type": "array", "maxItems": 16, "items": TAG_SCHEMA, "description": "Optional labels"},
                 "importance": {"type": "integer", "minimum": 1, "maximum": 5, "default": 3}}},
-            "memory:write", lambda a, c: {"stored": m.store(a["content"], a.get("tags", []), a["importance"], c.get("sub", ""))},
+            ("tools:write", "memory:write"), lambda a, c: {"stored": m.store(a["content"], a.get("tags", []), a["importance"], c.get("sub", ""))},
             read_only=False,
             output_schema={"type": "object", "required": ["stored"], "properties": {"stored": entry_obj}}))
         self._add(Tool(
@@ -71,7 +76,7 @@ class Catalog:
                 "query": {"type": "string", "minLength": 1, "maxLength": 200},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 5},
                 "tag": TAG_SCHEMA}},
-            "memory:read", self._recall, read_only=True,
+            ("tools:read", "memory:read"), self._recall, read_only=True,
             output_schema={"type": "object", "required": ["count", "results"],
                            "properties": {"count": {"type": "integer"}, "results": {"type": "array"}}}))
         self._add(Tool(
@@ -81,7 +86,7 @@ class Catalog:
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 20},
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
                 "tag": TAG_SCHEMA}},
-            "memory:read", self._list, read_only=True,
+            ("tools:read", "memory:read"), self._list, read_only=True,
             output_schema={"type": "object", "required": ["total", "entries"],
                            "properties": {"total": {"type": "integer"}, "entries": {"type": "array"}}}))
         self._add(Tool(
@@ -89,8 +94,29 @@ class Catalog:
             "Permanently delete one memory by id. Errors (isError) if the id does not exist.",
             {"type": "object", "additionalProperties": False, "required": ["id"], "properties": {
                 "id": {"type": "integer", "minimum": 1}}},
-            "memory:write", self._forget, read_only=False, destructive=True,
+            ("tools:write", "memory:write"), self._forget, read_only=False, destructive=True,
             output_schema={"type": "object", "required": ["deleted"], "properties": {"deleted": {"type": "integer"}}}))
+        self._add(Tool(
+            "memory_wipe", "Wipe all memories (admin)", "ADMIN. Delete every stored memory. Requires memory:admin and the literal confirmation text.",
+            {"type": "object", "additionalProperties": False, "required": ["confirm"], "properties": {
+                "confirm": {"type": "string", "enum": ["WIPE ALL MEMORIES"]}}},
+            ("tools:write", "memory:admin"), self._wipe, read_only=False, destructive=True))
+        self._add(Tool(
+            "whoami", "Who am I", "Return the verified identity, granted and effective scopes, signing key id and token expiry of the caller.",
+            {"type": "object", "additionalProperties": False, "properties": {}}, "tools:read", self._whoami, read_only=True))
+        self._add(Tool(
+            "token_introspect", "Introspect a token (admin)", "ADMIN. RFC 7662-style introspection of an access or refresh token.",
+            {"type": "object", "additionalProperties": False, "required": ["token"], "properties": {
+                "token": {"type": "string", "minLength": 1, "maxLength": 8192}}},
+            ("tools:read", "auth:admin"), self._introspect, read_only=True))
+        self._add(Tool(
+            "token_revoke", "Revoke a token or refresh family (admin)", "ADMIN. Revoke an access token (by jti) or a whole refresh family (by refresh token or family id).",
+            {"type": "object", "additionalProperties": False, "properties": {
+                "token": {"type": "string", "minLength": 1, "maxLength": 8192}, "family": {"type": "string", "pattern": "^[0-9a-f]{16}$"}}},
+            ("tools:write", "auth:admin"), self._revoke, read_only=False, destructive=True))
+        self._add(Tool(
+            "audit_verify", "Verify the token audit chain", "Verify the SHA-256 hash chain of the JWT/token audit log and return its head.",
+            {"type": "object", "additionalProperties": False, "properties": {}}, ("tools:read", "audit:read"), self._audit_verify, read_only=True))
         if self.llm is not None:
             self._add(Tool(
                 "llm_summarize_memories", "Summarize memories with an LLM (optional)",
@@ -99,7 +125,7 @@ class Catalog:
                 {"type": "object", "additionalProperties": False, "required": ["query"], "properties": {
                     "query": {"type": "string", "minLength": 1, "maxLength": 200},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5}}},
-                "memory:read", self._llm_summarize, read_only=True, needs_llm=True))
+                ("tools:read", "memory:read"), self._llm_summarize, read_only=True, needs_llm=True))
 
     def _recall(self, a, ctx):
         try:
@@ -116,6 +142,44 @@ class Catalog:
         if not self.memory.forget(a["id"]):
             raise ToolError("No memory with id %d" % a["id"])
         return {"deleted": a["id"]}
+
+    def _wipe(self, a, ctx):
+        n = 0
+        while True:
+            total, entries = self.memory.list(limit=100)
+            if not entries:
+                return {"wiped": n}
+            for e in entries:
+                self.memory.forget(e["id"])
+                n += 1
+
+    def _whoami(self, a, ctx):
+        c = ctx.get("claims") or {}
+        return {"sub": ctx.get("sub", ""), "client_id": c.get("client_id", ""), "granted_scopes": c.get("_granted", []),
+                "effective_scopes": c.get("_scopes", []), "kid": c.get("_kid", ""), "alg": c.get("_alg", ""), "exp": c.get("exp"),
+                "jti": c.get("jti", ""), "family": c.get("fam", ""), "auth_enabled": self.authenticator is not None}
+
+    def _introspect(self, a, ctx):
+        if self.service is None:
+            raise ToolError("authentication is disabled; nothing to introspect")
+        return self.service.introspect(a["token"])
+
+    def _revoke(self, a, ctx):
+        if self.service is None:
+            raise ToolError("authentication is disabled; nothing to revoke")
+        if bool(a.get("token")) == bool(a.get("family")):
+            raise ToolError("provide exactly one of token or family")
+        if a.get("family"):
+            if self.service.family_state(a["family"]) is None:
+                raise ToolError("unknown family")
+            self.service.revoke_family(a["family"], "admin_tool")
+            return {"revoked": "family", "family": a["family"]}
+        return {"revoked": self.service.revoke_token(a["token"], ctx.get("sub", ""), True, "admin_tool")}
+
+    def _audit_verify(self, a, ctx):
+        if self.token_audit is None:
+            raise ToolError("authentication is disabled; there is no token audit log")
+        return self.token_audit.verify()
 
     def _llm_summarize(self, a, ctx):
         results = self.memory.search(a["query"], a["limit"])
@@ -148,20 +212,21 @@ class Catalog:
          "description": "Newest memories carrying a tag (URL-encode the tag).", "mimeType": "application/json"},
     ]
 
-    def list_resources(self, scopes_ok_memory, scopes_ok_audit):
-        out = []
-        if scopes_ok_memory:
-            out.append({"uri": "memory://index", "name": "memory-index", "title": "Memory index",
-                        "description": "Counts, tag histogram and recent entries.", "mimeType": "application/json"})
-        if scopes_ok_audit:
-            out.append({"uri": "audit://chain", "name": "audit-chain", "title": "Audit chain status",
-                        "description": "Hash-chain verification result, contract counters and recent audit entries.",
-                        "mimeType": "application/json"})
-        if scopes_ok_memory:
+    def list_resources(self, has_scope):
+        J = "application/json"
+        out = [{"uri": "auth://whoami", "name": "auth-whoami", "title": "Caller identity", "description": "Verified identity, scopes and key id of this session.", "mimeType": J}]
+        if has_scope("memory:read"):
+            out.append({"uri": "memory://index", "name": "memory-index", "title": "Memory index", "description": "Counts, tag histogram and recent entries.", "mimeType": J})
+        if has_scope("audit:read"):
+            out.append({"uri": "audit://chain", "name": "audit-chain", "title": "Audit chain status", "description": "Protocol audit hash-chain verification, contract counters and recent entries.", "mimeType": J})
+            out.append({"uri": "auth://token-audit", "name": "token-audit", "title": "Token audit chain", "description": "JWT issue/validate/reject/revoke events (hash-chained).", "mimeType": J})
+        if has_scope("auth:admin"):
+            out.append({"uri": "auth://keys", "name": "auth-keys", "title": "Signing keys (public view)", "description": "kid/alg/status of every key. Secrets are never exposed.", "mimeType": J})
+            out.append({"uri": "auth://revocations", "name": "auth-revocations", "title": "Revocation list", "description": "Revoked jtis and refresh families.", "mimeType": J})
+        if has_scope("memory:read"):
             _, recent = self.memory.list(limit=25)
             for e in recent:
-                out.append({"uri": "memory://entry/%d" % e["id"], "name": "memory-%d" % e["id"],
-                            "description": "Memory #%d" % e["id"], "mimeType": "application/json"})
+                out.append({"uri": "memory://entry/%d" % e["id"], "name": "memory-%d" % e["id"], "description": "Memory #%d" % e["id"], "mimeType": J})
         return out
 
     ENTRY_RE = re.compile(r"^memory://entry/([0-9]{1,18})$")
@@ -173,6 +238,14 @@ class Catalog:
             return "index", "memory:read", None
         if uri == "audit://chain":
             return "audit", "audit:read", None
+        if uri == "auth://whoami":
+            return "whoami", "resources:read", None
+        if uri == "auth://token-audit":
+            return "token_audit", "audit:read", None
+        if uri == "auth://keys":
+            return "keys", "auth:admin", None
+        if uri == "auth://revocations":
+            return "revocations", "auth:admin", None
         m = self.ENTRY_RE.match(uri)
         if m:
             return "entry", "memory:read", int(m.group(1))

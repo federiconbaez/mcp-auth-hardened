@@ -1,17 +1,18 @@
-"""Simplified OIDC-style auth: HS256 JWTs + a tiny mock issuer.
+"""Hardened simplified-OIDC token validation (NEW code for mcp-auth-hardened; base64url helpers adapted from mcp-forge).
 
-THIS IS NOT FULL OIDC AND IS NOT CERTIFIED. What it is:
+THIS IS NOT FULL OIDC AND NOT CERTIFIED. What is implemented:
 
-* HS256 JSON Web Tokens implemented by hand with hmac/hashlib/base64
-  (RFC 7519 / RFC 7515 subset). Symmetric: the verifier and the issuer share one
-  secret, so there is no JWKS and no key rotation.
-* An OIDC-*like* discovery document and an OAuth2 ``client_credentials``-style
-  token endpoint (RFC 6749 section 4.4) with client_secret_basic / client_secret_post.
-* Validation of ``iss``, ``aud``, ``exp``, ``nbf``, ``iat``, signature
-  (constant-time compare) and ``scope``.
+* A keyring with several signing keys identified by ``kid``: HS256 (symmetric, secret never published) and RS256
+  (hand-written PKCS#1 v1.5 verification, public key publishable in a JWKS document).
+* Key lifecycle: active -> retired (verifies until ``retired_until``) -> revoked/expired (rejected). Rotation does not invalidate
+  tokens signed by the previous key during the grace period.
+* Algorithm pinning: the header ``alg`` must equal the algorithm recorded for that ``kid`` (blocks alg-confusion and ``none``).
+* Claim validation: iss, aud, sub, exp, iat, nbf, jti (required), clock-skew leeway, scope parsing + implication expansion.
+* Revocation: per-``jti`` and per-refresh-family (checked on every request, also on long-lived stdio sessions).
+* Hash-chained token audit log: every issue/validate/reject/revoke/refresh/reuse/key event.
 
-Not implemented: authorization-code flow, id_tokens for end users, PKCE,
-refresh tokens, JWKS/asymmetric keys, token revocation, dynamic client registration.
+Not implemented: authorization-code flow + PKCE, end-user id_tokens, dynamic client registration, JWKS fetching/caching
+by a remote client, mTLS/DPoP, token binding.
 """
 
 import base64
@@ -25,31 +26,39 @@ import re
 import secrets
 import time
 
-ALG = "HS256"
+from . import rsa
+
 MAX_TOKEN_LEN = 8192
 B64URL_RE = re.compile(r"^[A-Za-z0-9_-]*$")
 TOKEN_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+KID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 BASE_SCOPE = "mcp"
-ALL_SCOPES = ("mcp", "memory:read", "memory:write", "audit:read")
+ALL_SCOPES = ("mcp", "tools:read", "tools:write", "resources:read", "prompts:read", "memory:read", "memory:write",
+              "memory:admin", "audit:read", "auth:admin")
+# a scope on the left also grants every scope on the right (documented, tested; never implicit beyond this table)
+IMPLIES = {"tools:write": ("tools:read",), "memory:admin": ("memory:write", "memory:read"), "memory:write": ("memory:read",)}
 DEFAULT_AUDIENCE = "mcp-auth-hardened"
 DEFAULT_ISSUER = "http://127.0.0.1:8765"
+ALGS = ("HS256", "RS256")
 
-# Demo client registry for the mock issuer: client_id -> scopes it may request.
-# Secrets are *derived* from the server secret (see OidcIssuer.client_secret) so nothing is stored.
+# client registry for the mock issuer: client_id -> scopes it may request (+offline_access for refresh tokens)
 DEFAULT_CLIENTS = {
-    "demo-client": ("mcp", "memory:read", "memory:write", "audit:read"),
-    "readonly-client": ("mcp", "memory:read"),
+    "demo-client": ("mcp", "tools:read", "tools:write", "resources:read", "prompts:read", "memory:read", "memory:write", "memory:admin",
+                    "audit:read", "offline_access"),
+    "readonly-client": ("mcp", "tools:read", "resources:read", "prompts:read", "memory:read", "offline_access"),
+    "admin-client": ALL_SCOPES + ("offline_access",),
 }
 
 
 class AuthError(Exception):
     """Token or credential rejected. ``error`` follows RFC 6750 / RFC 6749 names."""
 
-    def __init__(self, error, description, status=401):
+    def __init__(self, error, description, status=401, reason=None):
         super().__init__("%s: %s" % (error, description))
         self.error = error
         self.description = description
         self.status = status
+        self.reason = reason or description  # short machine-ish reason for the audit log
 
 
 # ---- base64url (strict, canonical) ---------------------------------------
@@ -64,24 +73,13 @@ def b64url_decode(text):
         raw = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
     except (binascii.Error, ValueError):
         raise ValueError("invalid base64url")
-    if b64url_encode(raw) != text:  # reject non-canonical trailing bits
+    if b64url_encode(raw) != text:
         raise ValueError("non-canonical base64url")
     return raw
 
 
-# ---- JWT -----------------------------------------------------------------
-def _sign(secret, signing_input):
-    return hmac.new(secret, signing_input, hashlib.sha256).digest()
-
-
 def _json_b64(obj):
     return b64url_encode(json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-
-
-def encode_jwt(claims, secret):
-    header = {"alg": ALG, "typ": "JWT"}
-    signing_input = ("%s.%s" % (_json_b64(header), _json_b64(claims))).encode("ascii")
-    return signing_input.decode("ascii") + "." + b64url_encode(_sign(secret, signing_input))
 
 
 def _num(v):
@@ -96,169 +94,341 @@ def parse_scopes(claim):
     return set()
 
 
-class Authenticator:
-    """Validates tokens minted with the shared secret."""
+def expand_scopes(granted):
+    out = set(granted)
+    changed = True
+    while changed:
+        changed = False
+        for s in list(out):
+            for implied in IMPLIES.get(s, ()):
+                if implied not in out:
+                    out.add(implied)
+                    changed = True
+    return out
 
-    def __init__(self, secret, issuer, audience=DEFAULT_AUDIENCE, leeway=0, clock=time.time):
-        if not isinstance(secret, (bytes, bytearray)) or len(secret) < 16:
-            raise ValueError("secret must be at least 16 bytes")
-        self.secret = bytes(secret)
+
+def fingerprint(token):
+    """Short non-reversible handle for logs (never log the token itself)."""
+    return hashlib.sha256(token.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+# ---- keyring ----------------------------------------------------------------
+class Keyring:
+    """Persistent set of signing keys: <data_dir>/keys.json (0600), or a single in-memory HS256 key from $MCP_FORGE_SECRET.
+
+    Key record: {"kid", "alg", "status": active|retired|revoked, "created", "retired_until"?, "secret"(hex, HS256) | "rsa": {n,e,d}(hex)}
+    """
+
+    def __init__(self, path=None, env_secret=None, clock=time.time, grace=86400):
+        self.path = path
+        self.clock = clock
+        self.grace = grace
+        self.keys = []
+        if env_secret:
+            self.keys = [{"kid": "env", "alg": "HS256", "status": "active", "created": int(clock()), "secret": env_secret.encode("utf-8").hex()}]
+            self.path = None
+        elif path:
+            self._load_or_init()
+
+    # -- persistence
+    def _load_or_init(self):
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), mode=0o700, exist_ok=True)
+        if not os.path.exists(self.path):
+            self.keys = [self._new_hs256()]
+            try:
+                self._write_new()
+            except FileExistsError:
+                pass
+        self.reload()
+
+    def _write_new(self):
+        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"keys": self.keys, "client_master": secrets.token_hex(32)}, fh)
+
+    def reload(self):
+        if not self.path:
+            return
+        for _ in range(100):  # another process may still be writing the file
+            try:
+                with open(self.path) as fh:
+                    doc = json.load(fh)
+                self.keys = doc["keys"]
+                self.client_master = doc["client_master"].encode("ascii")
+                return
+            except (ValueError, KeyError, FileNotFoundError):
+                time.sleep(0.02)
+        raise ValueError("keys file unreadable: %s" % self.path)
+
+    def _save(self):
+        if not self.path:
+            return
+        tmp = self.path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"keys": self.keys, "client_master": self.client_master.decode("ascii")}, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.path)
+
+    @property
+    def client_master_secret(self):
+        return getattr(self, "client_master", None) or hashlib.sha256(b"env-client-master:" + bytes.fromhex(self.keys[0]["secret"])).digest()
+
+    # -- key creation
+    def _kid(self):
+        return "k-" + secrets.token_hex(4)
+
+    def _new_hs256(self):
+        return {"kid": self._kid(), "alg": "HS256", "status": "active", "created": int(self.clock()), "secret": secrets.token_hex(32)}
+
+    def _activate(self, key):
+        for k in self.keys:
+            if k["status"] == "active":
+                k["status"] = "retired"
+                k["retired_until"] = int(self.clock()) + self.grace
+        self.keys.append(key)
+        self._save()
+        return key
+
+    def rotate(self, alg="HS256", bits=2048):
+        """Create a new active key; the previous active key becomes retired for ``grace`` seconds."""
+        self.reload()
+        if alg == "HS256":
+            key = self._new_hs256()
+        elif alg == "RS256":
+            k = rsa.generate_key(bits)
+            key = {"kid": self._kid(), "alg": "RS256", "status": "active", "created": int(self.clock()),
+                   "rsa": {"n": "%x" % k["n"], "e": "%x" % k["e"], "d": "%x" % k["d"]}}
+        else:
+            raise ValueError("alg must be HS256 or RS256")
+        return self._activate(key)
+
+    def add_rsa_public(self, kid, n, e):
+        """Trust an externally generated RSA public key (verify-only)."""
+        if not KID_RE.match(kid) or self.get(kid):
+            raise ValueError("bad or duplicate kid")
+        key = {"kid": kid, "alg": "RS256", "status": "retired", "created": int(self.clock()), "retired_until": int(self.clock()) + 10 * 365 * 86400,
+               "rsa": {"n": "%x" % n, "e": "%x" % e}}
+        self.keys.append(key)
+        self._save()
+        return key
+
+    def set_status(self, kid, status):
+        self.reload()
+        key = self.get(kid)
+        if key is None:
+            raise ValueError("unknown kid")
+        if status == "revoked":
+            key["status"] = "revoked"
+        elif status == "retired":
+            key["status"] = "retired"
+            key["retired_until"] = int(self.clock()) + self.grace
+        self._save()
+        return key
+
+    # -- lookup
+    def get(self, kid):
+        for k in self.keys:
+            if k["kid"] == kid:
+                return k
+        return None
+
+    def active(self):
+        for k in reversed(self.keys):
+            if k["status"] == "active":
+                return k
+        raise ValueError("no active key")
+
+    def usable(self, key):
+        """(ok, reason) for verification at the current time."""
+        if key["status"] == "revoked":
+            return False, "signing key revoked"
+        if key["status"] == "retired" and self.clock() >= key.get("retired_until", 0):
+            return False, "signing key retired (grace period over)"
+        return True, ""
+
+    def public_view(self):
+        """What may be published (JWKS-like). HS256 secrets and RSA private exponents are NEVER included."""
+        out = []
+        for k in self.keys:
+            item = {"kid": k["kid"], "alg": k["alg"], "use": "sig", "status": k["status"], "created": k["created"]}
+            if k["alg"] == "RS256":
+                n, e = int(k["rsa"]["n"], 16), int(k["rsa"]["e"], 16)
+                item.update({"kty": "RSA", "n": rsa.int_to_b64u(n), "e": rsa.int_to_b64u(e)})
+            else:
+                item.update({"kty": "oct", "x-note": "symmetric key: secret withheld, cannot be published; verify through introspection"})
+            out.append(item)
+        return out
+
+    # -- signing / verifying primitives
+    def sign(self, signing_input, key):
+        if key["alg"] == "HS256":
+            return hmac.new(bytes.fromhex(key["secret"]), signing_input, hashlib.sha256).digest()
+        r = key["rsa"]
+        if "d" not in r:
+            raise ValueError("verify-only key cannot sign")
+        return rsa.sign(signing_input, int(r["n"], 16), int(r["d"], 16))
+
+    def check_signature(self, signing_input, signature, key):
+        if key["alg"] == "HS256":
+            return hmac.compare_digest(hmac.new(bytes.fromhex(key["secret"]), signing_input, hashlib.sha256).digest(), signature)
+        return rsa.verify(signing_input, signature, int(key["rsa"]["n"], 16), int(key["rsa"]["e"], 16))
+
+
+class Authenticator:
+    """Validates tokens against a Keyring, a revocation oracle and an audit sink."""
+
+    def __init__(self, keyring, issuer, audience=DEFAULT_AUDIENCE, leeway=30, clock=time.time, allow_kidless=False,
+                 revocations=None, audit=None):
+        self.keyring = keyring
         self.issuer = issuer
         self.audience = audience
         self.leeway = leeway
         self.clock = clock
+        self.allow_kidless = allow_kidless
+        self.revocations = revocations   # object with is_revoked(jti, fam) -> reason|None
+        self.audit = audit               # callable(event, **detail) or None
 
-    def mint(self, subject="demo-user", scopes=ALL_SCOPES, ttl=3600, audience=None, issuer=None,
-             not_before_offset=0, issued_at_offset=0):
+    # -- audit helper
+    def _emit(self, event, **detail):
+        if self.audit:
+            self.audit(event, **detail)
+
+    # -- issuing
+    def mint(self, subject="demo-user", scopes=ALL_SCOPES, ttl=3600, audience=None, issuer=None, not_before_offset=0,
+             issued_at_offset=0, client_id=None, family=None, kid=None, extra=None):
+        key = self.keyring.get(kid) if kid else self.keyring.active()
+        if key is None:
+            raise ValueError("unknown kid")
         now = int(self.clock())
-        claims = {
-            "iss": issuer or self.issuer,
-            "sub": subject,
-            "aud": audience or self.audience,
-            "iat": now + issued_at_offset,
-            "nbf": now + not_before_offset,
-            "exp": now + int(ttl),
-            "scope": " ".join(scopes),
-            "jti": secrets.token_hex(8),
-        }
-        return encode_jwt(claims, self.secret)
+        claims = {"iss": issuer or self.issuer, "sub": subject, "aud": audience or self.audience, "iat": now + issued_at_offset,
+                  "nbf": now + not_before_offset, "exp": now + int(ttl), "scope": " ".join(scopes), "jti": secrets.token_hex(12)}
+        if client_id:
+            claims["client_id"] = client_id
+        if family:
+            claims["fam"] = family
+        claims.update(extra or {})
+        header = {"alg": key["alg"], "typ": "JWT", "kid": key["kid"]}
+        signing_input = ("%s.%s" % (_json_b64(header), _json_b64(claims))).encode("ascii")
+        token = signing_input.decode("ascii") + "." + b64url_encode(self.keyring.sign(signing_input, key))
+        self._emit("issue", jti=claims["jti"], sub=subject, kid=key["kid"], alg=key["alg"], scope=claims["scope"], fp=fingerprint(token),
+                   exp=claims["exp"], client_id=client_id or "", fam=family or "")
+        return token
 
-    def verify(self, token, required_scopes=()):
-        """Return the claims dict or raise AuthError."""
+    # -- verification
+    def verify(self, token, required_scopes=(), source=""):
+        try:
+            claims = self._verify(token, required_scopes)
+        except AuthError as exc:
+            self._emit("reject", reason=exc.reason, error=exc.error, fp=fingerprint(token) if isinstance(token, str) else "", source=source)
+            raise
+        self._emit("validate", jti=claims["jti"], sub=claims["sub"], kid=claims["_kid"], source=source)
+        return claims
+
+    def _parse(self, token):
         if not isinstance(token, str) or not token or len(token) > MAX_TOKEN_LEN:
-            raise AuthError("invalid_token", "token missing or too long")
+            raise AuthError("invalid_token", "token missing or too long", reason="missing_or_too_long")
         if not TOKEN_RE.match(token):
-            raise AuthError("invalid_token", "token contains characters outside the base64url/JWS alphabet")
+            raise AuthError("invalid_token", "token contains characters outside the base64url/JWS alphabet", reason="bad_alphabet")
         parts = token.split(".")
         if len(parts) != 3:
-            raise AuthError("invalid_token", "token is not a compact JWS (3 parts)")
+            raise AuthError("invalid_token", "token is not a compact JWS (3 parts)", reason="not_jws")
         try:
             header = json.loads(b64url_decode(parts[0]).decode("utf-8"))
             signature = b64url_decode(parts[2])
         except (ValueError, UnicodeDecodeError):
-            raise AuthError("invalid_token", "malformed token encoding")
-        if not isinstance(header, dict) or header.get("alg") != ALG:
-            raise AuthError("invalid_token", "unsupported or missing alg (only HS256 is accepted)")
-        expected = _sign(self.secret, (parts[0] + "." + parts[1]).encode("ascii"))
-        if not hmac.compare_digest(expected, signature):
-            raise AuthError("invalid_token", "signature verification failed")
+            raise AuthError("invalid_token", "malformed token encoding", reason="bad_encoding")
+        if not isinstance(header, dict):
+            raise AuthError("invalid_token", "header must be an object", reason="bad_header")
+        return parts, header, signature
+
+    def _verify(self, token, required_scopes, check_time=True, check_revocation=True):
+        parts, header, signature = self._parse(token)
+        alg = header.get("alg")
+        if alg not in ALGS:
+            raise AuthError("invalid_token", "unsupported or missing alg (HS256 and RS256 only)", reason="alg_not_allowed")
+        signing_input = (parts[0] + "." + parts[1]).encode("ascii")
+        kid = header.get("kid")
+        if kid is None:
+            if not (self.allow_kidless and alg == "HS256"):
+                raise AuthError("invalid_token", "missing kid", reason="missing_kid")
+            candidates = [k for k in self.keyring.keys if k["alg"] == "HS256" and self.keyring.usable(k)[0]]
+            key = None
+            for k in candidates:  # constant-time per key; no early exit on first mismatch timing beyond key count
+                if self.keyring.check_signature(signing_input, signature, k):
+                    key = k
+            if key is None:
+                raise AuthError("invalid_token", "signature verification failed", reason="bad_signature")
+        else:
+            if not isinstance(kid, str) or not KID_RE.match(kid):
+                raise AuthError("invalid_token", "malformed kid", reason="bad_kid")
+            key = self.keyring.get(kid)
+            if key is None:
+                raise AuthError("invalid_token", "unknown kid", reason="unknown_kid")
+            if key["alg"] != alg:
+                raise AuthError("invalid_token", "alg does not match the key's algorithm", reason="alg_confusion")
+            ok, why = self.keyring.usable(key)
+            if not ok:
+                raise AuthError("invalid_token", why, reason=why.replace(" ", "_"))
+            if not self.keyring.check_signature(signing_input, signature, key):
+                raise AuthError("invalid_token", "signature verification failed", reason="bad_signature")
         try:
             claims = json.loads(b64url_decode(parts[1]).decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
-            raise AuthError("invalid_token", "malformed claims")
+            raise AuthError("invalid_token", "malformed claims", reason="bad_claims")
         if not isinstance(claims, dict):
-            raise AuthError("invalid_token", "claims must be an object")
+            raise AuthError("invalid_token", "claims must be an object", reason="bad_claims")
         now = self.clock()
         if claims.get("iss") != self.issuer:
-            raise AuthError("invalid_token", "wrong issuer")
+            raise AuthError("invalid_token", "wrong issuer", reason="wrong_issuer")
         aud = claims.get("aud")
         auds = [aud] if isinstance(aud, str) else (aud if isinstance(aud, list) else [])
         if self.audience not in auds:
-            raise AuthError("invalid_token", "wrong audience")
+            raise AuthError("invalid_token", "wrong audience", reason="wrong_audience")
         if not isinstance(claims.get("sub"), str) or not claims["sub"]:
-            raise AuthError("invalid_token", "missing sub")
+            raise AuthError("invalid_token", "missing sub", reason="missing_sub")
+        if not isinstance(claims.get("jti"), str) or not claims["jti"]:
+            raise AuthError("invalid_token", "missing jti", reason="missing_jti")
         if not _num(claims.get("exp")):
-            raise AuthError("invalid_token", "missing exp")
-        if now >= claims["exp"] + self.leeway:
-            raise AuthError("invalid_token", "token expired")
+            raise AuthError("invalid_token", "missing exp", reason="missing_exp")
+        if check_time and now >= claims["exp"] + self.leeway:
+            raise AuthError("invalid_token", "token expired", reason="expired")
         if not _num(claims.get("iat")):
-            raise AuthError("invalid_token", "missing iat")
-        if claims["iat"] > now + self.leeway:
-            raise AuthError("invalid_token", "iat is in the future")
+            raise AuthError("invalid_token", "missing iat", reason="missing_iat")
+        if check_time and claims["iat"] > now + self.leeway:
+            raise AuthError("invalid_token", "iat is in the future", reason="iat_future")
         if "nbf" in claims:
             if not _num(claims["nbf"]):
-                raise AuthError("invalid_token", "bad nbf")
-            if claims["nbf"] > now + self.leeway:
-                raise AuthError("invalid_token", "token not yet valid (nbf)")
+                raise AuthError("invalid_token", "bad nbf", reason="bad_nbf")
+            if check_time and claims["nbf"] > now + self.leeway:
+                raise AuthError("invalid_token", "token not yet valid (nbf)", reason="nbf_future")
+        if check_revocation and self.revocations is not None:
+            why = self.revocations.is_revoked(claims["jti"], claims.get("fam"))
+            if why:
+                raise AuthError("invalid_token", "token has been revoked", reason="revoked:" + why)
         granted = parse_scopes(claims.get("scope"))
-        missing = [s for s in required_scopes if s not in granted]
+        effective = expand_scopes(granted)
+        missing = [s for s in required_scopes if s not in effective]
         if missing:
-            raise AuthError("insufficient_scope", "missing scope: " + " ".join(missing), status=403)
-        claims["_scopes"] = sorted(granted)
+            raise AuthError("insufficient_scope", "missing scope: " + " ".join(missing), status=403, reason="insufficient_scope")
+        claims["_scopes"] = sorted(effective)
+        claims["_granted"] = sorted(granted)
+        claims["_kid"] = key["kid"]
+        claims["_alg"] = key["alg"]
         return claims
 
+    def inspect(self, token):
+        """Signature+claims check ignoring time and revocation (used by revoke/introspect to read jti safely). Raises AuthError."""
+        return self._verify(token, (), check_time=False, check_revocation=False)
+
     def still_valid(self, claims):
-        """Cheap re-check used on long-lived stdio sessions: has exp passed since initialize?"""
-        return self.clock() < claims["exp"] + self.leeway
-
-
-def load_or_create_secret(data_dir):
-    """Secret from $MCP_FORGE_SECRET, else <data_dir>/oidc_secret (created 0600)."""
-    env = os.environ.get("MCP_FORGE_SECRET")
-    if env:
-        if len(env.encode("utf-8")) < 16:
-            raise ValueError("MCP_FORGE_SECRET must be at least 16 bytes")
-        return env.encode("utf-8")
-    os.makedirs(data_dir, mode=0o700, exist_ok=True)
-    path = os.path.join(data_dir, "oidc_secret")
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        # Another process may still be writing it; wait briefly for content.
-        for _ in range(50):
-            with open(path, "rb") as fh:
-                data = fh.read().strip()
-            if len(data) >= 16:
-                return data
-            time.sleep(0.02)
-        raise ValueError("secret file exists but is empty/short: %s" % path)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(secrets.token_hex(32).encode("ascii"))
-    with open(path, "rb") as fh:
-        return fh.read().strip()
-
-
-class OidcIssuer:
-    """Mock issuer: discovery document + client_credentials token endpoint."""
-
-    def __init__(self, authenticator, clients=None, default_ttl=3600):
-        self.auth = authenticator
-        self.clients = dict(clients or DEFAULT_CLIENTS)
-        self.default_ttl = default_ttl
-
-    def client_secret(self, client_id):
-        digest = hmac.new(self.auth.secret, b"mcpauth-client:" + client_id.encode("utf-8"), hashlib.sha256)
-        return digest.hexdigest()[:32]
-
-    def discovery_document(self):
-        iss = self.auth.issuer.rstrip("/")
-        return {
-            "issuer": self.auth.issuer,
-            "token_endpoint": iss + "/oauth/token",
-            "grant_types_supported": ["client_credentials"],
-            "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post"],
-            "response_types_supported": [],
-            "subject_types_supported": ["public"],
-            "id_token_signing_alg_values_supported": [ALG],
-            "scopes_supported": list(ALL_SCOPES),
-            "x-mcp-auth-hardened-note": "simplified mock issuer: HS256 shared-secret, no JWKS, not OIDC-certified",
-        }
-
-    def token_request(self, authorization_header, form):
-        """Returns (http_status, body_dict). ``form`` is a dict of str -> str."""
-        if form.get("grant_type") != "client_credentials":
-            return 400, {"error": "unsupported_grant_type", "error_description": "only client_credentials"}
-        client_id, client_secret = None, None
-        if authorization_header and authorization_header.lower().startswith("basic "):
-            try:
-                raw = base64.b64decode(authorization_header[6:].strip(), validate=True).decode("utf-8")
-                client_id, _, client_secret = raw.partition(":")
-            except (binascii.Error, ValueError, UnicodeDecodeError):
-                return 401, {"error": "invalid_client", "error_description": "malformed Basic credentials"}
-        else:
-            client_id, client_secret = form.get("client_id"), form.get("client_secret")
-        if not client_id or client_secret is None:
-            return 401, {"error": "invalid_client", "error_description": "client authentication required"}
-        known = client_id in self.clients
-        expected = self.client_secret(client_id if known else "unknown")
-        ok = hmac.compare_digest(expected.encode("utf-8"), client_secret.encode("utf-8"))
-        if not (known and ok):
-            return 401, {"error": "invalid_client", "error_description": "bad client credentials"}
-        allowed = self.clients[client_id]
-        requested = form.get("scope")
-        scopes = tuple(requested.split()) if requested else tuple(allowed)
-        if not scopes or any(s not in allowed for s in scopes):
-            return 400, {"error": "invalid_scope", "error_description": "scope not permitted for this client"}
-        ttl = self.default_ttl
-        token = self.auth.mint(subject=client_id, scopes=scopes, ttl=ttl)
-        return 200, {"access_token": token, "token_type": "Bearer", "expires_in": ttl, "scope": " ".join(scopes)}
+        """Per-request re-check on long-lived (stdio) sessions: not expired, not revoked, key still usable."""
+        if self.clock() >= claims["exp"] + self.leeway:
+            return False
+        key = self.keyring.get(claims.get("_kid", ""))
+        if key is not None and not self.keyring.usable(key)[0]:
+            return False
+        if self.revocations is not None and self.revocations.is_revoked(claims["jti"], claims.get("fam")):
+            return False
+        return True
