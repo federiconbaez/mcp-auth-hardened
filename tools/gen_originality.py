@@ -46,6 +46,9 @@ def block():
     parts = []
     rc, out = sh(sys.executable, "tools/check_stdlib_only.py")
     parts.append("### AST stdlib-only check (live run, exit code %d)\n\n```\n%s\n```\n" % (rc, out))
+    rep = os.path.join(ROOT, "evidence", "adaptation_report.txt")
+    if os.path.exists(rep):
+        parts.append("### Lines inherited from mcp-base / mcp-forge, per file (`evidence/adaptation_report.txt`)\n\n```\n%s\n```\n" % open(rep).read().rstrip())
     rc, out = sh("git", "log", "--reverse", "--format=%h  %an  %aI  %s")
     rc2, count = sh("git", "rev-list", "--count", "HEAD")
     parts.append("### Git history (%s commits at generation time; later commits only touch docs/evidence)\n\n```\n%s\n```\n" % (count, out))

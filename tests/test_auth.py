@@ -59,6 +59,18 @@ class KeyringTests(TempDirTestCase):
         self.assertIn("RSA", view)
         self.assertIn("oct", view)
 
+    def test_published_rsa_key_alone_is_enough_to_verify_signatures(self):
+        """A relying party that only has the JWKS (n, e) must be able to verify what the server signs."""
+        from mcpauth import rsa
+        a, kr, _ = mk(self.tmp)
+        key = kr.rotate("RS256", 1024)
+        item = [k for k in kr.public_view() if k["kid"] == key["kid"]][0]
+        n, e = int.from_bytes(b64url_decode(item["n"]), "big"), int.from_bytes(b64url_decode(item["e"]), "big")
+        msg = b"header.payload"
+        sig = kr.sign(msg, kr.get(key["kid"]))
+        self.assertTrue(rsa.verify(msg, sig, n, e))
+        self.assertFalse(rsa.verify(msg + b"x", sig, n, e))
+
     def test_env_secret_gives_single_in_memory_key(self):
         kr = Keyring(None, env_secret="x" * 20)
         self.assertEqual([k["kid"] for k in kr.keys], ["env"])

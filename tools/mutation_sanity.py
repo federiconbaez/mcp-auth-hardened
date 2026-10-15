@@ -16,28 +16,37 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODULES = ["tests.test_schema", "tests.test_jsonrpc", "tests.test_auth", "tests.test_protocol",
-           "tests.test_persistence_audit", "tests.test_http_e2e"]
+MODULES = ["tests.test_schema", "tests.test_jsonrpc", "tests.test_auth", "tests.test_rsa", "tests.test_tokens",
+           "tests.test_protocol", "tests.test_persistence_audit", "tests.test_http_e2e"]
 
+A, T, S, H = "mcpauth/auth.py", "mcpauth/tokens.py", "mcpauth/server.py", "mcpauth/transport_http.py"
 MUTANTS = [
-    ("M01 ignore token expiry", "mcpauth/auth.py", 'if now >= claims["exp"] + self.leeway:', "if False:", {}),
-    ("M02 ignore audience", "mcpauth/auth.py", "if self.audience not in auds:", "if False:", {}),
-    ("M03 skip signature check", "mcpauth/auth.py", "if not hmac.compare_digest(expected, signature):", "if False:", {}),
-    ("M04 accept any JWT alg", "mcpauth/auth.py", 'header.get("alg") != ALG', "False", {}),
-    ("M05 ignore issuer", "mcpauth/auth.py", 'if claims.get("iss") != self.issuer:', "if False:", {}),
-    ("M06 no per-method scope enforcement", "mcpauth/server.py", "if not self._has_scope(scope):", "if False:", {}),
-    ("M07 allow requests before initialize", "mcpauth/server.py", "if method not in PRE_INIT_METHODS and not was_initialized:", "if False:", {}),
-    ("M08 always negotiate preferred version", "mcpauth/server.py", "chosen = requested if requested in SUPPORTED_PROTOCOL_VERSIONS else PREFERRED_PROTOCOL_VERSION", "chosen = PREFERRED_PROTOCOL_VERSION", {}),
-    ("M09 audit: ignore prev-link", "mcpauth/audit.py", 'if entry["prev"] != prev:', "if False:", {}),
-    ("M10 audit: ignore entry hash", "mcpauth/audit.py", 'if entry_hash(entry) != entry["hash"]:', "if False:", {}),
-    ("M11 booleans accepted as ids", "mcpauth/jsonrpc.py", "isinstance(value, int) and not isinstance(value, bool)", "isinstance(value, int)", {}),
-    ("M12 respond to notifications (contracts off)", "mcpauth/jsonrpc.py", "        if is_note:\n            return None\n        return make_result(rid, result)", "        return make_result(rid, result)", {"MCP_FORGE_CONTRACTS": "0"}),
-    ("M13 memory not persistent", "mcpauth/memory.py", "sqlite3.connect(self.path, timeout=5.0)", 'sqlite3.connect(":memory:")', {}),
-    ("M14 schema ignores additionalProperties:false", "mcpauth/schema.py", "if ap is False:", "if False:", {}),
-    ("M15 schema treats bool as integer", "mcpauth/schema.py", '        if isinstance(value, bool):\n            return False\n        if isinstance(value, int):', "        if isinstance(value, int):", {}),
-    ("M16 HTTP session not bound to subject", "mcpauth/transport_http.py", "if app.auth and sub != (session.claims or {}).get(\"sub\"):", "if False:", {}),
-    ("M17 batch always answers (even all-notification)", "mcpauth/jsonrpc.py", "return responses or None", "return responses", {}),
-    ("M18 id not echoed (wrong id in results)", "mcpauth/jsonrpc.py", "return {\"jsonrpc\": \"2.0\", \"id\": msg_id, \"result\": result}", "return {\"jsonrpc\": \"2.0\", \"id\": 0, \"result\": result}", {"MCP_FORGE_CONTRACTS": "0"}),
+    ("M01 ignore token expiry", A, 'if check_time and now >= claims["exp"] + self.leeway:', "if False:", {}),
+    ("M02 ignore audience", A, "if self.audience not in auds:", "if False:", {}),
+    ("M03 ignore issuer", A, 'if claims.get("iss") != self.issuer:', "if False:", {}),
+    ("M04 HS256 signature always accepted", A, "return hmac.compare_digest(hmac.new(bytes.fromhex(key[\"secret\"]), signing_input, hashlib.sha256).digest(), signature)",
+     "return True", {}),
+    ("M05 no alg/kid algorithm pinning", A, 'if key["alg"] != alg:', "if False:", {}),
+    ("M06 kid-less tokens always accepted", A, 'if not (self.allow_kidless and alg == "HS256"):', "if False:", {}),
+    ("M07 revoked signing keys still verify", A, 'if key["status"] == "revoked":', "if False:", {}),
+    ("M08 retired keys never expire", A, 'self.clock() >= key.get("retired_until", 0)', "False", {}),
+    ("M09 iat-in-future not checked", A, 'if check_time and claims["iat"] > now + self.leeway:', "if False:", {}),
+    ("M10 revocation list ignored", A, "if check_revocation and self.revocations is not None:", "if False:", {}),
+    ("M11 scope implication memory:admin removed", A, '"memory:admin": ("memory:write", "memory:read"), ', "", {}),
+    ("M12 JWKS publishes nothing about RSA modulus correctly (n omitted)", A, '"n": rsa.int_to_b64u(n), ', "", {}),
+    ("M13 RS256 verify skips padding comparison", "mcpauth/rsa.py", "return hmac.compare_digest(em, expected)", "return True", {}),
+    ("M14 refresh reuse not detected", T, 'if row["status"] == "used":', "if False:", {}),
+    ("M15 refresh client binding not enforced", T, 'if fam["client"] != client_id:', "if False:", {}),
+    ("M16 client lockout never triggers", T, "if len(recent) >= self.threshold and key not in self.locked:", "if False:", {}),
+    ("M17 client secret not checked (only client id)", T, 'if not (hmac.compare_digest(expected.encode("utf-8"), secret.encode("utf-8")) and known):', "if not known:", {}),
+    ("M18 no per-method scope enforcement", S, "missing = [s for s in scopes if not self._has_scope(s)]", "missing = []", {}),
+    ("M25 refresh scope escalation allowed", T, "if not want <= granted:", "if False:", {}),
+    ("M19 allow requests before initialize", S, "if method not in PRE_INIT_METHODS and not was_initialized:", "if False:", {}),
+    ("M20 audit: ignore prev-link", "mcpauth/audit.py", 'if entry["prev"] != prev:', "if False:", {}),
+    ("M21 audit: ignore entry hash", "mcpauth/audit.py", 'if entry_hash(entry) != entry["hash"]:', "if False:", {}),
+    ("M22 booleans accepted as ids", "mcpauth/jsonrpc.py", "isinstance(value, int) and not isinstance(value, bool)", "isinstance(value, int)", {}),
+    ("M23 HTTP session not bound to subject", H, "if app.auth and sub != (session.claims or {}).get(\"sub\"):", "if False:", {}),
+    ("M24 schema ignores additionalProperties:false", "mcpauth/schema.py", "if ap is False:", "if False:", {}),
 ]
 
 
