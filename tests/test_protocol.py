@@ -96,7 +96,8 @@ class ToolsResourcesPromptsTests(TempDirTestCase):
 
     def test_tools_list_descriptors(self):
         tools = {t["name"]: t for t in self.c.call("tools/list")["result"]["tools"]}
-        self.assertEqual(set(tools), {"memory_store", "memory_recall", "memory_list", "memory_forget"})
+        self.assertEqual(len(tools), 9)
+        self.assertTrue({"memory_store", "memory_recall", "memory_list", "memory_forget", "whoami", "token_revoke"} <= set(tools))
         self.assertNotIn("title", tools["memory_store"])  # 2025-06-18 only
         self.assertTrue(tools["memory_forget"]["annotations"]["destructiveHint"])
         self.assertTrue(tools["memory_list"]["annotations"]["readOnlyHint"])
@@ -222,7 +223,7 @@ class ScopeEnforcementTests(TempDirTestCase):
         return c
 
     def test_read_only_scope(self):
-        c = self.client("mcp memory:read")
+        c = self.client("mcp tools:read memory:read resources:read")
         self.assertEqual(c.tool("memory_store", {"content": "x"})["error"]["code"], -32003)
         self.assertEqual(c.tool("memory_forget", {"id": 1})["error"]["code"], -32003)
         self.assertEqual(c.call("resources/read", {"uri": "audit://chain"})["error"]["code"], -32003)
@@ -233,23 +234,24 @@ class ScopeEnforcementTests(TempDirTestCase):
     def test_only_base_scope(self):
         c = self.client("mcp")
         self.assertEqual(c.tool("memory_list", {})["error"]["code"], -32003)
+        self.assertEqual(c.call("tools/list")["error"]["code"], -32003)
         self.assertEqual(c.call("prompts/get", {"name": "memory_digest"})["error"]["code"], -32003)
-        self.assertEqual(c.call("resources/list")["result"]["resources"], [])
-        self.assertIn("tools", c.call("tools/list")["result"])
+        self.assertEqual(c.call("resources/list")["error"]["code"], -32003)
+        self.assertEqual(c.call("ping")["result"], {})
 
     def test_error_data_names_required_scope(self):
-        err = self.client("mcp").tool("memory_store", {"content": "x"})["error"]
-        self.assertEqual(err["data"]["required"], ["memory:write"])
+        err = self.client("mcp tools:read").tool("memory_store", {"content": "x"})["error"]
+        self.assertEqual(err["data"]["required"], ["tools:write", "memory:write"])
 
     def test_initialize_requires_valid_token_and_base_scope(self):
-        for tok, code in ((None, -32001), ("junk", -32001), (token(ttl=-5), -32001), (token("memory:read"), -32003)):
+        for tok, code in ((None, -32001), ("junk", -32001), (token(ttl=-300), -32001), (token("memory:read"), -32003)):
             c = InProc(self.server.new_session("test", tok))
             out = c.send(init_msg())
             self.assertEqual(out["error"]["code"], code, tok)
             self.assertEqual(c.call("tools/list")["error"]["code"], -32600)
 
     def test_token_expiring_mid_session_is_enforced(self):
-        from mcpauth.auth import Authenticator
+        Authenticator = helpers.Authenticator
         clock = [1_800_000_000]
         auth = Authenticator(helpers.SECRET, helpers.ISSUER, clock=lambda: clock[0])
         server = helpers.McpServer(os.path.join(self.tmp, "d2"), auth, audit_fsync=False)
@@ -257,7 +259,7 @@ class ScopeEnforcementTests(TempDirTestCase):
         c = InProc(server.new_session("stdio", tok))
         c.init()
         self.assertIn("result", c.call("tools/list"))
-        clock[0] += 31
+        clock[0] += 31 + 30  # exp + default 30s leeway
         self.assertEqual(c.call("tools/list")["error"]["code"], -32001)
 
     def test_auth_failure_is_audited(self):
@@ -325,3 +327,30 @@ class LifecycleModelCheck(TempDirTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RateLimitProtocolTests(TempDirTestCase):
+    def test_burst_then_32005_with_retry_after_ping_exempt_and_per_subject(self):
+        from mcpauth.tokens import RateLimiter
+
+        class Clk:
+            t = 1_800_000_000.0
+
+            def __call__(self):
+                return self.t
+        clk = Clk()
+        server = make_server(self.data_dir, auth=True, limiter=RateLimiter(1, 3, clock=clk))
+        a = InProc(server.new_session("test", token(subject="alice")))
+        self.assertIn("result", a.send(init_msg()))
+        codes = [a.call("tools/list", mid=i).get("error", {}).get("code") for i in range(10, 16)]
+        self.assertIn(-32005, codes)
+        self.assertEqual(codes[:2], [None, None])
+        err = a.call("tools/list", mid=99)["error"]
+        self.assertEqual(err["code"], -32005)
+        self.assertGreater(err["data"]["retry_after_seconds"], 0)
+        self.assertEqual(a.call("ping", mid=100)["result"], {})
+        b = InProc(server.new_session("test", token(subject="bob")))
+        self.assertIn("result", b.send(init_msg()))
+        self.assertIn("result", b.call("tools/list", mid=2))
+        clk.t += 5
+        self.assertIn("result", a.call("tools/list", mid=101))

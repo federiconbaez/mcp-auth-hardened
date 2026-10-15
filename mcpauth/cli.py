@@ -258,11 +258,11 @@ def cmd_client_secret(args):
     return 0
 
 
-def _verify_cmd(path, args):
+def _verify_cmd(path, args, label="AUDIT"):
     res = verify_file(path, args.expect_head, args.expect_count)
     print(json.dumps(res, indent=2, sort_keys=True))
-    print("CHAIN OK: %d entries, head %s" % (res["count"], res["head"]) if res["ok"]
-          else "CHAIN BROKEN at line %s: %s" % (res["line"], res["error"]), file=sys.stderr)
+    print("%s CHAIN OK: %d entries, head %s" % (label, res["count"], res["head"]) if res["ok"]
+          else "%s CHAIN BROKEN at line %s: %s" % (label, res["line"], res["error"]), file=sys.stderr)
     return 0 if res["ok"] else 1
 
 
@@ -271,7 +271,7 @@ def cmd_audit_verify(args):
 
 
 def cmd_token_audit_verify(args):
-    return _verify_cmd(os.path.join(args.data_dir, "token_audit.log"), args)
+    return _verify_cmd(os.path.join(args.data_dir, "token_audit.log"), args, "TOKEN AUDIT")
 
 
 def cmd_audit_tail(args):

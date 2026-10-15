@@ -14,7 +14,7 @@ class StdioE2E(TempDirTestCase):
         self.assertEqual(init["result"]["protocolVersion"], "2025-03-26")
         s.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         tools = s.call("tools/list", mid=2)["result"]["tools"]
-        self.assertEqual(len(tools), 4)
+        self.assertEqual(len(tools), 9)
         r = s.call("tools/call", {"name": "memory_store", "arguments": {"content": "e2e"}}, mid=3)
         self.assertFalse(r["result"]["isError"])
         # batch + notification in one line
@@ -43,7 +43,7 @@ class StdioE2E(TempDirTestCase):
         s.close()
 
     def test_bad_tokens_rejected_end_to_end(self):
-        for tok in (token(ttl=-10), token(audience="x"), token("memory:read"), token()[:-5] + "AAAAA", "junk"):
+        for tok in (token(ttl=-300), token(audience="x"), token("memory:read"), token()[:-5] + "AAAAA", "junk"):
             s = StdioServer(self.data_dir, tok)
             self.assertIn("error", s.call("initialize", init_msg()["params"]), tok)
             self.assertEqual(s.call("tools/list", mid=2)["error"]["code"], -32600)

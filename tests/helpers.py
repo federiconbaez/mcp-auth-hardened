@@ -12,12 +12,19 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from mcpauth.auth import Authenticator  # noqa: E402
+from mcpauth.auth import ALL_SCOPES, Keyring  # noqa: E402
+from mcpauth.auth import Authenticator as _Authenticator  # noqa: E402
+from mcpauth.tokens import AuthStore, TokenAudit, TokenService  # noqa: E402
 from mcpauth.server import McpServer  # noqa: E402
 from mcpauth.transport_http import HttpTransport  # noqa: E402
 
 SECRET = b"unit-test-secret-0123456789abcdef"
 ISSUER = "http://issuer.test"
+ALL = " ".join(ALL_SCOPES)
+
+
+def Authenticator(secret, issuer, **kw):  # noqa: N802 - compat shim: single HS256 key (kid "env"), like $MCP_FORGE_SECRET
+    return _Authenticator(Keyring(None, env_secret=secret.decode()), issuer, **kw)
 
 
 def init_msg(version="2025-03-26", mid=1):
@@ -61,12 +68,20 @@ class InProc:
         return self.send(rpc("tools/call", {"name": name, "arguments": args}, mid))
 
 
-def make_server(data_dir, auth=True, llm=None, fsync=False):
-    authenticator = Authenticator(SECRET, ISSUER) if auth else None
-    return McpServer(data_dir, authenticator, llm, audit_fsync=fsync)
+def make_server(data_dir, auth=True, llm=None, fsync=False, clock=None, limiter=None, leeway=30, issuer=ISSUER, **akw):
+    """McpServer wired like the CLI does: keyring(env secret) + revocation store + token audit + token service."""
+    if not auth:
+        return McpServer(data_dir, None, llm, audit_fsync=fsync, limiter=limiter)
+    os.makedirs(data_dir, exist_ok=True)
+    store = AuthStore(os.path.join(data_dir, "auth.sqlite3"))
+    tokaudit = TokenAudit(os.path.join(data_dir, "token_audit.log"), fsync=fsync)
+    kw = {"clock": clock} if clock else {}
+    authenticator = _Authenticator(Keyring(None, env_secret=SECRET.decode()), issuer, leeway=leeway, revocations=store, audit=tokaudit, **kw, **akw)
+    service = TokenService(authenticator, store, audit=tokaudit)
+    return McpServer(data_dir, authenticator, llm, audit_fsync=fsync, service=service, token_audit=tokaudit, limiter=limiter)
 
 
-def token(scopes="mcp memory:read memory:write audit:read", **kw):
+def token(scopes=ALL, **kw):
     a = Authenticator(SECRET, ISSUER)
     ttl = kw.pop("ttl", 3600)
     return a.mint(scopes=scopes.split(), ttl=ttl, **kw)

@@ -22,6 +22,7 @@ import urllib.parse
 
 from . import __version__, fuzz
 from .audit import verify_file
+from .auth import ALL_SCOPES
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VERSIONS = ("2025-03-26", "2024-11-05", "2025-06-18")
@@ -69,7 +70,7 @@ class Env:
         return subprocess.run([sys.executable, "-m", "mcpauth", *args], capture_output=True, text=True,
                               env=self.pyenv(), cwd=ROOT, timeout=30)
 
-    def mint(self, scope="mcp memory:read memory:write audit:read", ttl=3600, aud=None, issuer=None, sub="conformance"):
+    def mint(self, scope=" ".join(ALL_SCOPES), ttl=3600, aud=None, issuer=None, sub="conformance"):
         key = (scope, ttl, aud, issuer, sub)
         if key not in self._tokens:
             args = ["mint-token", "--data-dir", self.data_dir, "--issuer", issuer or self.issuer, "--sub", sub,
@@ -690,7 +691,7 @@ def _(c):
 
 @check("AUT-007", "Per-tool scope enforced (-32003): read-only token cannot store/forget", "scope claims")
 def _(c):
-    cl = c.client(token=c.env.mint(scope="mcp memory:read"))
+    cl = c.client(token=c.env.mint(scope="mcp tools:read resources:read memory:read"))
     cl.error("tools/call", {"name": "memory_store", "arguments": {"content": "x"}}, code=-32003)
     cl.error("tools/call", {"name": "memory_forget", "arguments": {"id": 1}}, code=-32003)
     cl.error("resources/read", {"uri": "audit://chain"}, code=-32003)
@@ -915,6 +916,239 @@ def _(c):
     expect(not verify_file(copy)["ok"], "mid-chain deletion not detected")
 
 
+
+# ---------------------------------------------------------------------------------
+# Hardened-auth specifics (mcp-auth-hardened)
+# ---------------------------------------------------------------------------------
+def _keys(c):
+    """The conformance harness owns the server's temp data dir; it reads keys.json only to forge hostile tokens."""
+    with open(os.path.join(c.env.data_dir, "keys.json")) as fh:
+        return json.load(fh)
+
+
+def _forge(c, header, claims_patch=None, key=None, sign=True):
+    import base64
+    import hashlib
+    import hmac as _hmac
+    keys = _keys(c)["keys"]
+    key = key or [k for k in keys if k["status"] == "active"][-1]
+    now = int(time.time())
+    claims = {"iss": c.env.issuer, "sub": "forger", "aud": "mcp-auth-hardened", "iat": now, "nbf": now, "exp": now + 600,
+              "scope": " ".join(ALL_SCOPES), "jti": "forged-" + str(now)}
+    claims.update(claims_patch or {})
+    enc = lambda o: base64.urlsafe_b64encode(json.dumps(o, separators=(",", ":")).encode()).rstrip(b"=").decode()
+    signing = enc(header) + "." + enc(claims)
+    sig = _hmac.new(bytes.fromhex(key["secret"]), signing.encode(), hashlib.sha256).digest() if sign else b""
+    return signing + "." + base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
+
+
+@check("HRD-001", "Token without kid is rejected (even with a valid signature); unknown kid rejected", "RFC 7515 s4.1.4; key identification")
+def _(c):
+    key = [k for k in _keys(c)["keys"] if k["status"] == "active"][-1]
+    _auth_rejected(c, _forge(c, {"alg": "HS256", "typ": "JWT"}, key=key), "kidless token")
+    _auth_rejected(c, _forge(c, {"alg": "HS256", "typ": "JWT", "kid": "k-deadbeef"}, key=key), "unknown kid")
+    _auth_rejected(c, _forge(c, {"alg": "HS256", "typ": "JWT", "kid": "../../x"}, key=key), "malformed kid")
+    cl = c.client(token=_forge(c, {"alg": "HS256", "typ": "JWT", "kid": key["kid"]}, key=key))  # control: same forge WITH correct kid works
+    cl.result("ping")
+
+
+@check("HRD-002", "Algorithm pinning: alg must match the key's algorithm (RS256 header on an HS256 kid is rejected)", "RFC 8725 s3.1 (alg confusion)")
+def _(c):
+    key = [k for k in _keys(c)["keys"] if k["status"] == "active"][-1]
+    _auth_rejected(c, _forge(c, {"alg": "RS256", "typ": "JWT", "kid": key["kid"]}, key=key), "RS256 header, HS256 key")
+    _auth_rejected(c, _forge(c, {"alg": "HS512", "typ": "JWT", "kid": key["kid"]}, key=key), "unsupported alg")
+    _auth_rejected(c, _forge(c, {"alg": "none", "typ": "JWT", "kid": key["kid"]}, key=key, sign=False), "alg none with kid")
+
+
+@check("HRD-003", "Per-method scope table: tools:read alone lists tools but cannot call them; resources/prompts need their own scopes", "per-method scope enforcement")
+def _(c):
+    cl = c.client(token=c.env.mint(scope="mcp tools:read"))
+    expect(cl.result("tools/list")["tools"])
+    e = cl.error("tools/call", {"name": "memory_list", "arguments": {}}, code=-32003)
+    expect(e["data"]["required"] == ["memory:read"], e)
+    cl.error("resources/list", code=-32003)
+    cl.error("prompts/list", code=-32003)
+    cl.error("tools/call", {"name": "memory_wipe", "arguments": {"confirm": "WIPE ALL MEMORIES"}}, code=-32003)
+    cl.result("ping")
+
+
+@check("HRD-004", "Scope implication: memory:admin => memory:write => memory:read; tools:write => tools:read", "documented scope hierarchy")
+def _(c):
+    cl = c.client(token=c.env.mint(scope="mcp tools:write resources:read memory:admin"))
+    expect(cl.result("tools/list")["tools"])  # tools:read implied by tools:write
+    r = cl.tool("memory_store", {"content": "implied scopes"})
+    expect(r["isError"] is False, r)
+    me = json.loads(cl.tool("whoami", {})["content"][0]["text"])
+    expect({"memory:read", "memory:write", "tools:read"} <= set(me["effective_scopes"]) and "memory:read" not in me["granted_scopes"], me)
+
+
+@check("HRD-005", "Admin-only tools require auth:admin / memory:admin", "per-tool scopes")
+def _(c):
+    cl = c.client(token=c.env.mint(scope="mcp tools:read tools:write memory:read memory:write audit:read"))
+    cl.error("tools/call", {"name": "token_introspect", "arguments": {"token": "x"}}, code=-32003)
+    cl.error("tools/call", {"name": "token_revoke", "arguments": {"family": "0" * 16}}, code=-32003)
+    cl.error("tools/call", {"name": "memory_wipe", "arguments": {"confirm": "WIPE ALL MEMORIES"}}, code=-32003)
+    expect(cl.tool("audit_verify", {})["isError"] is False)
+
+
+@check("HRD-006", "Key rotation: a token of the retired key stays valid during grace; a revoked key is rejected immediately", "key lifecycle")
+def _(c):
+    old = c.env.mint(sub="rot-old")
+    r = c.env.cli("keys", "rotate", "--data-dir", c.env.data_dir)
+    expect(r.returncode == 0, r.stderr)
+    new_kid = json.loads(r.stdout)["rotated_to"]
+    new_tok = c.env.cli("mint-token", "--data-dir", c.env.data_dir, "--issuer", c.env.issuer, "--sub", "rot-new").stdout.strip()
+    import base64
+    expect(json.loads(base64.urlsafe_b64decode(new_tok.split(".")[0] + "=="))["kid"] == new_kid, "new tokens use the new active key")
+    c.client(token=old).result("ping")
+    c.client(token=new_tok).result("ping")
+    r2 = c.env.cli("keys", "revoke", new_kid, "--data-dir", c.env.data_dir)
+    expect(r2.returncode == 0, r2.stderr)
+    _auth_rejected(c, new_tok, "token of revoked key")
+    c.client(token=old).result("ping")
+
+
+@check("HRD-007", "Revocation by jti is enforced on new connections AND mid-session", "RFC 7009; revocation list")
+def _(c):
+    tok = c.env.cli("mint-token", "--data-dir", c.env.data_dir, "--issuer", c.env.issuer, "--sub", "revoke-me").stdout.strip()
+    cl = c.client(token=tok)
+    cl.result("tools/list")
+    r = c.env.cli("token-revoke", "--data-dir", c.env.data_dir, "--issuer", c.env.issuer, tok)
+    expect(r.returncode == 0 and "revoked_jti" in r.stdout, r.stdout + r.stderr)
+    if c.transport == "stdio":
+        cl.error("tools/list", code=-32001)  # same live process notices the revocation on the next request
+    _auth_rejected(c, tok, "revoked token on a fresh connection")
+
+
+@check("HRD-008", "Clock-skew leeway: a token expired by a few seconds is still accepted, one expired by minutes is not", "RFC 7519 s4.1.4 leeway")
+def _(c):
+    c.client(token=c.env.mint(ttl=-5, sub="skew-ok")).result("ping")
+    _auth_rejected(c, c.env.mint(ttl=-300, sub="skew-bad"), "expired beyond leeway")
+
+
+@check("HRD-009", "Discovery document lists jwks/introspection/revocation endpoints; JWKS exposes no HS256 secret and no RSA private part", "RFC 8414/7517 (simplified)", ("http",))
+def _(c):
+    conn = HttpConn(c.env)
+    c.opened.append(conn)
+    doc = json.loads(conn.request("GET", "/.well-known/openid-configuration")[1])
+    expect(all(k in doc for k in ("jwks_uri", "introspection_endpoint", "revocation_endpoint")) and "refresh_token" in doc["grant_types_supported"], doc)
+    st, body = conn.request("GET", "/.well-known/jwks.json")
+    expect(st == 200, st)
+    keys = json.loads(body)["keys"]
+    expect(keys and all("kid" in k and "alg" in k for k in keys), keys)
+    for k in _keys(c)["keys"]:
+        if "secret" in k:
+            expect(k["secret"] not in body, "HS256 secret leaked in JWKS")
+        if "rsa" in k and "d" in k["rsa"]:
+            expect(k["rsa"]["d"] not in body, "RSA private exponent leaked")
+    expect(all("k" not in j and "d" not in j for j in keys), "JWKS must not carry k/d members")
+
+
+def _form(**kw):
+    return urllib.parse.urlencode(kw)
+
+
+def _post_form(conn, path, form, basic=None):
+    import base64
+    h = {"Content-Type": "application/x-www-form-urlencoded"}
+    if basic:
+        h["Authorization"] = "Basic " + base64.b64encode(("%s:%s" % basic).encode()).decode()
+    st, body = conn.request("POST", path, form, h)
+    return st, (json.loads(body) if body else {})
+
+
+def _secret(c, client):
+    return c.env.cli("client-secret", "--data-dir", c.env.data_dir, client).stdout.strip()
+
+
+@check("HRD-010", "Refresh rotation + reuse detection over HTTP: replayed refresh token revokes the family and its access tokens", "RFC 6749 s6; OAuth 2.0 Security BCP (rotation)", ("http",))
+def _(c):
+    conn = HttpConn(c.env)
+    c.opened.append(conn)
+    basic = ("demo-client", _secret(c, "demo-client"))
+    st, t1 = _post_form(conn, "/oauth/token", _form(grant_type="client_credentials", scope="mcp tools:read offline_access"), basic)
+    expect(st == 200 and t1.get("refresh_token", "").startswith("rt_"), t1)
+    st, t2 = _post_form(conn, "/oauth/token", _form(grant_type="refresh_token", refresh_token=t1["refresh_token"]), basic)
+    expect(st == 200 and t2["refresh_token"] != t1["refresh_token"], t2)
+    Client(HttpConn(c.env, t2["access_token"])).initialize()
+    st, bad = _post_form(conn, "/oauth/token", _form(grant_type="refresh_token", refresh_token=t1["refresh_token"]), basic)
+    expect(st == 400 and bad["error"] == "invalid_grant" and "reuse" in bad["error_description"], (st, bad))
+    st, bad2 = _post_form(conn, "/oauth/token", _form(grant_type="refresh_token", refresh_token=t2["refresh_token"]), basic)
+    expect(st == 400 and bad2["error"] == "invalid_grant", "newest token of the revoked family must be dead too")
+    probe = HttpConn(c.env, t2["access_token"])
+    c.opened.append(probe)
+    s, _ = probe.request("POST", "/mcp", _init_msg(), {"Content-Type": "application/json"})
+    expect(s == 401, "access token of the revoked family must be rejected, got %s" % s)
+
+
+@check("HRD-011", "Refresh cannot escalate scope; wrong client cannot use someone else's refresh token", "RFC 6749 s6", ("http",))
+def _(c):
+    conn = HttpConn(c.env)
+    c.opened.append(conn)
+    basic = ("demo-client", _secret(c, "demo-client"))
+    st, t1 = _post_form(conn, "/oauth/token", _form(grant_type="client_credentials", scope="mcp tools:read offline_access"), basic)
+    st, e = _post_form(conn, "/oauth/token", _form(grant_type="refresh_token", refresh_token=t1["refresh_token"], scope="mcp memory:admin"), basic)
+    expect(st == 400 and e["error"] == "invalid_scope", (st, e))
+    st, e = _post_form(conn, "/oauth/token", _form(grant_type="refresh_token", refresh_token=t1["refresh_token"]), ("readonly-client", _secret(c, "readonly-client")))
+    expect(st == 400 and e["error"] == "invalid_grant", (st, e))
+    st, ok = _post_form(conn, "/oauth/token", _form(grant_type="refresh_token", refresh_token=t1["refresh_token"], scope="mcp"), basic)
+    expect(st == 200 and ok["scope"] == "mcp", (st, ok))
+
+
+@check("HRD-012", "Introspection: only privileged clients; active/inactive answers; revocation endpoint always answers 200", "RFC 7662 / RFC 7009", ("http",))
+def _(c):
+    conn = HttpConn(c.env)
+    c.opened.append(conn)
+    admin = ("admin-client", _secret(c, "admin-client"))
+    demo = ("demo-client", _secret(c, "demo-client"))
+    st, tok = _post_form(conn, "/oauth/token", _form(grant_type="client_credentials", scope="mcp tools:read"), demo)
+    st, i1 = _post_form(conn, "/oauth/introspect", _form(token=tok["access_token"]), admin)
+    expect(st == 200 and i1["active"] is True and i1["client_id"] == "demo-client" and i1["scope"] == "mcp tools:read" and "kid" in i1, i1)
+    st, _x = _post_form(conn, "/oauth/introspect", _form(token=tok["access_token"]), demo)
+    expect(st == 403, st)
+    st, _x = _post_form(conn, "/oauth/introspect", _form(token=tok["access_token"]), ("admin-client", "wrong"))
+    expect(st == 401, st)
+    st, _x = _post_form(conn, "/oauth/revoke", _form(token="garbage"), demo)
+    expect(st == 200, st)
+    st, _x = _post_form(conn, "/oauth/revoke", _form(token=tok["access_token"]), demo)
+    expect(st == 200, st)
+    st, i2 = _post_form(conn, "/oauth/introspect", _form(token=tok["access_token"]), admin)
+    expect(i2 == {"active": False}, i2)
+    st, i3 = _post_form(conn, "/oauth/introspect", _form(token="not-a-token"), admin)
+    expect(i3 == {"active": False}, i3)
+
+
+@check("HRD-013", "Client lockout: repeated bad client credentials -> 429 + Retry-After; other clients unaffected", "brute-force protection", ("http",))
+def _(c):
+    conn = HttpConn(c.env)
+    c.opened.append(conn)
+    codes = []
+    for i in range(8):
+        st, _x = _post_form(conn, "/oauth/token", _form(grant_type="client_credentials"), ("lockout-victim", "bad-%d" % i))
+        codes.append(st)
+    expect(codes[:4] == [401] * 4 and 429 in codes[5:], codes)
+    expect("retry-after" in conn.headers, conn.headers)
+    st, _x = _post_form(conn, "/oauth/token", _form(grant_type="client_credentials", scope="mcp"), ("demo-client", _secret(c, "demo-client")))
+    expect(st == 200, "an unrelated client must not be locked out")
+
+
+@check("HRD-014", "Token audit log is hash-chained, records issue/validate/reject/revoke/refresh/reuse, never contains a raw token", "JWT audit trail", ("http",))
+def _(c):
+    res = c.env.cli("token-audit-verify", "--data-dir", c.env.data_dir)
+    expect(res.returncode == 0, res.stdout + res.stderr)
+    path = os.path.join(c.env.data_dir, "token_audit.log")
+    with open(path) as fh:
+        text = fh.read()
+    events = set()
+    for line in text.splitlines():
+        payload = json.loads(json.loads(line)["payload"])
+        events.add(payload["event"])
+    expect({"issue", "validate", "reject", "revoke", "refresh", "reuse_detected", "lockout"} <= events, sorted(events))
+    import re
+    expect(not re.search(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.", text), "a raw JWT leaked into the audit log")
+    expect("rt_" not in text, "a raw refresh token leaked into the audit log")
+
+
 # ---------------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------------
@@ -956,6 +1190,7 @@ def run_suite(transports=("stdio", "http")):
                 ctx.close_all()
         env.stop_http()
         chain = verify_file(os.path.join(env.data_dir, "audit.log"))
+        token_chain = verify_file(os.path.join(env.data_dir, "token_audit.log"))
     finally:
         env.cleanup()
     passed = sum(1 for r in results if r["status"] == "pass")
@@ -963,7 +1198,7 @@ def run_suite(transports=("stdio", "http")):
         "suite": "mcp-auth-hardened conformance", "server_version": __version__, "python": sys.version.split()[0],
         "started_unix": int(started), "duration_s": round(time.time() - started, 2),
         "summary": {"total": len(results), "passed": passed, "failed": len(results) - passed},
-        "final_invariants": final, "final_audit_chain": chain, "results": results,
+        "final_invariants": final, "final_audit_chain": chain, "final_token_audit_chain": token_chain, "results": results,
         "note": "Black-box suite written by the same author as the server; it demonstrates self-consistency and "
                 "coverage of the listed spec clauses, not independent certification.",
     }

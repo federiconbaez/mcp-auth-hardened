@@ -196,11 +196,18 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self._path()
-        if path == "/mcp":
-            return self._post_mcp()
-        if path in ("/oauth/token", "/oauth/introspect", "/oauth/revoke") and self.app.issuer:
-            return self._post_token(path)
-        self._json(404, {"error": "not_found"})
+        try:
+            if path == "/mcp":
+                return self._post_mcp()
+            if path in ("/oauth/token", "/oauth/introspect", "/oauth/revoke") and self.app.issuer:
+                return self._post_token(path)
+            self._json(404, {"error": "not_found"})
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+        except Exception as exc:  # noqa: BLE001 - a handler bug must become a 500, never a dropped connection
+            self._event("internal_error", {"path": path, "error": type(exc).__name__})
+            self.close_connection = True
+            self._json(500, {"error": "server_error"})
 
     def do_DELETE(self):
         if self._path() != "/mcp":

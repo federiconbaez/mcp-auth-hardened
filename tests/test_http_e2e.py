@@ -54,14 +54,14 @@ class Base(TempDirTestCase):
 class HttpE2E(Base):
     def setUp(self):
         super().setUp()
-        from mcpauth.auth import Authenticator
-        self.server = helpers.McpServer(self.data_dir, Authenticator(helpers.SECRET, None), audit_fsync=False)
+        Authenticator = helpers.Authenticator
+        self.server = helpers.make_server(self.data_dir, issuer=None)
         self.t = start_http(self.server)
         self.addCleanup(self.t.shutdown)
         self.issuer = self.t.auth.issuer  # derived from the bound ephemeral port
         self.assertEqual(self.issuer, "http://127.0.0.1:%d" % self.t.port)
 
-    def tok(self, scopes="mcp memory:read memory:write audit:read", **kw):
+    def tok(self, scopes=helpers.ALL, **kw):
         a = self.t.auth
         return a.mint(scopes=scopes.split(), **kw)
 
@@ -102,7 +102,7 @@ class HttpE2E(Base):
         st, out = c.rpc(init_msg())
         self.assertEqual(st, 401)
         self.assertIn("Bearer", c.headers["www-authenticate"])
-        for bad in (self.tok(ttl=-5), self.tok(audience="other"), self.tok(issuer="http://evil"), self.tok()[:-4] + "AAAA", "junk"):
+        for bad in (self.tok(ttl=-300), self.tok(audience="other"), self.tok(issuer="http://evil"), self.tok()[:-4] + "AAAA", "junk"):
             c = Http(self.t.port, bad)
             st, out = c.rpc(init_msg())
             self.assertEqual(st, 401, bad)

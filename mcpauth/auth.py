@@ -146,6 +146,18 @@ class Keyring:
         with os.fdopen(fd, "w") as fh:
             json.dump({"keys": self.keys, "client_master": secrets.token_hex(32)}, fh)
 
+    def maybe_reload(self):
+        """Pick up changes made by another process (rotation, revocation) - cheap: one stat() per call."""
+        if not self.path:
+            return
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return
+        sig = (st.st_mtime_ns, st.st_size)
+        if sig != getattr(self, "_sig", None):
+            self.reload()
+
     def reload(self):
         if not self.path:
             return
@@ -155,6 +167,8 @@ class Keyring:
                     doc = json.load(fh)
                 self.keys = doc["keys"]
                 self.client_master = doc["client_master"].encode("ascii")
+                st = os.stat(self.path)
+                self._sig = (st.st_mtime_ns, st.st_size)
                 return
             except (ValueError, KeyError, FileNotFoundError):
                 time.sleep(0.02)
@@ -224,6 +238,9 @@ class Keyring:
         elif status == "retired":
             key["status"] = "retired"
             key["retired_until"] = int(self.clock()) + self.grace
+        if not any(k["status"] == "active" for k in self.keys):
+            # revoking/retiring the only active key must not leave the issuer unable to sign: roll a fresh one
+            self.keys.append(self._new_hs256())
         self._save()
         return key
 
@@ -344,6 +361,7 @@ class Authenticator:
         return parts, header, signature
 
     def _verify(self, token, required_scopes, check_time=True, check_revocation=True):
+        self.keyring.maybe_reload()
         parts, header, signature = self._parse(token)
         alg = header.get("alg")
         if alg not in ALGS:
@@ -426,6 +444,7 @@ class Authenticator:
         """Per-request re-check on long-lived (stdio) sessions: not expired, not revoked, key still usable."""
         if self.clock() >= claims["exp"] + self.leeway:
             return False
+        self.keyring.maybe_reload()
         key = self.keyring.get(claims.get("_kid", ""))
         if key is not None and not self.keyring.usable(key)[0]:
             return False
