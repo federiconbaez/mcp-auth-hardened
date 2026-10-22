@@ -1,5 +1,14 @@
 # mcp-auth-hardened
 
+> **ES:** Servidor MCP con capa de autenticación endurecida (simplificada) en Python 3 stdlib: scopes por método, rotación de refresh tokens con detección de reuso, revocación e introspección, rotación de claves por kid (HS256 y RS256 escrito a mano), rate limiting y log de tokens encadenado.
+> Probar: `python3 -m unittest discover -s tests -t .`
+>
+> **EN:** MCP server with a hardened (still simplified) auth layer in Python 3 stdlib: per-method scopes, refresh-token rotation with reuse detection, revocation and introspection, kid-based key rotation (HS256 and hand-written RS256), rate limiting and a hash-chained token log.
+> Test: `python3 -m unittest discover -s tests -t .`
+>
+> **Estado / Status:** 153 tests en verde en la box (Python 3.13.5, Linux 6.12, x86_64) el 2026-10-22; **no auditado** por un tercero / **not independently audited**. Implementación didáctica, no un IdP de producción / teaching implementation, not a production IdP. Licencia / License: Apache-2.0.
+
+
 An **MCP server with a hardened (but still simplified) OIDC-style authentication layer**, pure Python 3, standard library only:
 multi-scope tokens with per-method enforcement, refresh-token rotation with reuse detection, revocation + introspection,
 `kid`-based key rotation (HS256 and a **hand-written RS256**), a hash-chained token audit log, rate limiting and lockout,
